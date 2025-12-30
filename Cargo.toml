@@ -1,6 +1,38 @@
 [package]
 name = "grave"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+description = "A page based storage engine w/ fire-and-forget writes and crash-safe durability semantics"
+license = "Apache-2.0"
+repository = "https://github.com/frozen-lab/grave"
+keywords = ["database", "persistence", "async-io", "storage"]
+categories = ["Caching"]
+exclude = ["shell.nix"]
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.178"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+incremental = false
+opt-level = 3
+
+[profile.bench]
+codegen-units = 1
+lto = "fat"
+incremental = false
+opt-level = 3
+debug = true
+debug-assertions = false
+strip = false
+
+[profile.profile]
+inherits = "release"
+debug = true
+lto = "off"
+opt-level = 2
+codegen-units = 1
+debug-assertions = false
+overflow-checks = false
+strip = "none"
