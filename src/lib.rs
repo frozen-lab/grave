@@ -1,5 +1,5 @@
 #![deny(missing_docs)]
-// #![deny(unused_must_use)]
+#![deny(unused_must_use)]
 #![doc = include_str!("../README.md")]
 
 #[allow(unused)]
@@ -17,7 +17,6 @@ mod pool;
 /// const fn assert_send_sync<T: Send + Sync>() {}
 /// const _: () = assert_send_sync::<Grave>();
 /// ```
-#[derive(Debug)]
 pub struct Grave;
 
 unsafe impl Send for Grave {}
