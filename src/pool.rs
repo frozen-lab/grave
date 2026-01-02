@@ -3,8 +3,11 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+const INVALID_SLOT: u32 = u32::MAX;
+pub(crate) type SLOT = *mut u8;
+
 pub(crate) struct BufPool {
-    b_pointer: NonNull<u8>,
+    start_ptr: PoolPtr,
     num_slots: u32,
     slot_size: u32,
     free_head: AtomicU32,
@@ -13,9 +16,6 @@ pub(crate) struct BufPool {
 
 unsafe impl Send for BufPool {}
 unsafe impl Sync for BufPool {}
-
-const INVALID_SLOT: u32 = u32::MAX;
-pub(crate) type SLOT = *mut u8;
 
 impl BufPool {
     pub(crate) fn new(num_slots: u32, slot_size: u32) -> Self {
@@ -26,16 +26,17 @@ impl BufPool {
         let pool_size = (slot_size * num_slots) as usize;
         let mut pool = Vec::<u8>::with_capacity(pool_size);
 
-        // NOTE: `Vec::with_capacity(N)` allocates memory but leavs `len = 0`, as we use
-        // the raw pointers to access different slots, if len stays at 0, it'd be UB
-        // Also for us to reconstruct vector from `b_pointer` in the `drop` becomes invalid
+        // NOTE: `Vec::with_capacity(N)` allocates memory but keeps the len at 0. We use
+        // raw pointers to access different slots, if the len stays at 0, it'd create
+        // undefined behavior. Also, the reconstruct of vector from the pointer would become
+        // invalid. To avoid memory leaks, we reconstruct the vec from the pointer in the drop.
         unsafe { pool.set_len(pool_size) };
 
-        let b_pointer = unsafe { NonNull::new_unchecked(pool.as_mut_ptr()) };
+        let start_ptr = PoolPtr::new(pool.as_mut_ptr());
 
         // NOTE: When the `pool` is dropped, it'll free up the entire memory. This should not happen,
         // as we own the underlying memory via mutable pointer, which is an implicit owenership,
-        // so we avoid destruction of `pool`, when it goes out of scope
+        // so we avoid destruction of `pool` when it goes out of scope.
         std::mem::forget(pool);
 
         let mut next = Vec::with_capacity(num_slots as usize);
@@ -45,7 +46,7 @@ impl BufPool {
         }
 
         Self {
-            b_pointer,
+            start_ptr,
             num_slots,
             slot_size,
             free_head: AtomicU32::new(0),
@@ -54,9 +55,8 @@ impl BufPool {
     }
 
     #[inline(always)]
-    pub(crate) fn alloc(&self) -> Option<SLOT> {
+    pub(crate) fn alloc(&self) -> Option<PoolSlot> {
         let mut head = self.free_head.load(Ordering::Acquire);
-
         loop {
             if head == INVALID_SLOT {
                 return None;
@@ -68,8 +68,7 @@ impl BufPool {
                 .compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
-                    let slot = unsafe { self.b_pointer.as_ptr().add((self.slot_size * head) as usize) };
-                    return Some(slot);
+                    return Some(self.start_ptr.add((self.slot_size * head) as usize));
                 }
                 Err(h) => head = h,
             }
@@ -77,8 +76,8 @@ impl BufPool {
     }
 
     #[inline(always)]
-    pub(crate) fn free(&self, ptr: SLOT) {
-        let offset = unsafe { ptr.offset_from(self.b_pointer.as_ptr()) } as usize;
+    pub(crate) fn free(&self, ptr: PoolSlot) {
+        let offset = self.start_ptr.offset_from(ptr);
         let idx = offset as u32 / self.slot_size;
 
         // sanity check
@@ -104,7 +103,7 @@ impl Drop for BufPool {
 
         // NOTE: we reconstruct original allocation from the stored pointer, so it could
         // automatically be freed by the compiler
-        let _ = unsafe { Vec::from_raw_parts(self.b_pointer.as_ptr(), size, size) };
+        let _ = unsafe { Vec::from_raw_parts(self.start_ptr.0, size, size) };
     }
 }
 
@@ -123,5 +122,87 @@ impl std::fmt::Display for BufPool {
             "BufPool {{ slots: {}, slot_size: {} bytes, free: {} }}",
             self.num_slots, self.slot_size, free,
         )
+    }
+}
+
+//
+// Pool Pointer
+//
+
+struct PoolPtr(SLOT);
+
+impl PoolPtr {
+    #[inline]
+    const fn new(ptr: SLOT) -> Self {
+        unsafe { Self(NonNull::new_unchecked(ptr).as_ptr()) }
+    }
+
+    #[inline]
+    const fn add(&self, count: usize) -> PoolSlot {
+        unsafe { PoolSlot::new(self.0.add(count)) }
+    }
+
+    #[inline]
+    const fn offset_from(&self, ptr: PoolSlot) -> usize {
+        unsafe { ptr.0.offset_from(self.0) as usize }
+    }
+}
+
+//
+// Pool Slot
+//
+
+#[derive(Debug, PartialEq, Clone)]
+pub(crate) struct PoolSlot(SLOT);
+
+impl PoolSlot {
+    #[inline]
+    const fn new(ptr: SLOT) -> Self {
+        Self(ptr)
+    }
+
+    #[inline]
+    const fn ptr(&self) -> SLOT {
+        self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn params_validation() {
+        let pool = BufPool::new(0x10, 0x10);
+
+        assert_eq!(pool.num_slots, 0x10);
+        assert_eq!(pool.slot_size, 0x10);
+    }
+
+    #[test]
+    fn alloc_and_free_cycle() {
+        let pool = BufPool::new(1, 0x10);
+
+        let slot = pool.alloc();
+        assert!(slot.is_some());
+
+        let slot2 = pool.alloc();
+        assert!(slot2.is_none());
+
+        pool.free(slot.unwrap());
+
+        let slot3 = pool.alloc();
+        assert!(slot3.is_some());
+    }
+
+    #[test]
+    fn alloc_reuses_same_slot() {
+        let pool = BufPool::new(0x10, 0x10);
+
+        let s1 = pool.alloc().expect("new slot");
+        pool.free(s1.clone());
+        let s2 = pool.alloc().expect("new slot");
+
+        assert_eq!(s1, s2);
     }
 }
