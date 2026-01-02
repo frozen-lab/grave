@@ -120,24 +120,53 @@ impl BufPool {
     #[inline(always)]
     pub(crate) fn alloc_n(&self, n: usize) -> AllocBatch {
         let mut batch = AllocBatch::new();
-        while batch.count < n {
-            let head = self.free_head.load(Ordering::Acquire);
-            if head == INVALID_SLOT {
-                break;
+        let mut head = self.free_head.load(Ordering::Acquire);
+
+        loop {
+            let (idx, tag) = _unpack_pool_idx(head);
+            if idx == INVALID_SLOT {
+                return batch;
             }
 
-            let next = self.free_next[head as usize].load(Ordering::Relaxed);
-            if self
+            // local walk
+            let mut cur = idx;
+            let mut last = cur;
+            let mut count = 1;
+
+            while count < n {
+                let next = self.free_next[last as usize].load(Ordering::Relaxed);
+
+                // NOTE: This is valid becuse, next is already only the index (unpacked version) of
+                // the slot
+                if next == INVALID_SLOT {
+                    break;
+                }
+
+                last = next;
+                count += 1;
+            }
+
+            let new_head_idx = self.free_next[last as usize].load(Ordering::Relaxed);
+            let new_head = _pack_pool_idx(new_head_idx, 1 + tag);
+
+            match self
                 .free_head
-                .compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+                .compare_exchange(head, new_head, Ordering::AcqRel, Ordering::Acquire)
             {
-                batch.slots.push(self.start_ptr.add(head * self.slot_size));
-                batch.count += 1;
+                Ok(_) => {
+                    // materialize slots
+                    let mut cur = idx;
+                    for _ in 0..count {
+                        batch.slots.push(self.start_ptr.add(cur * self.slot_size));
+                        cur = self.free_next[cur as usize].load(Ordering::Relaxed);
+                    }
+
+                    batch.count = count;
+                    return batch;
+                }
+                Err(h) => head = h,
             }
         }
-
-        batch
     }
 
     #[inline(always)]
@@ -152,30 +181,33 @@ impl BufPool {
             let off = self.start_ptr.offset_from(slot);
             let idx = (off as u64) / self.slot_size;
 
-            // TODO: Use of `unlikely` branch hint
             if first == INVALID_SLOT {
                 first = idx;
                 last = idx;
-                continue;
+            } else {
+                self.free_next[last as usize].store(idx, Ordering::Relaxed);
+                last = idx;
             }
-
-            self.free_next[last as usize].store(idx, Ordering::Relaxed);
-            last = idx;
         }
 
         let mut head = self.free_head.load(Ordering::Acquire);
         loop {
-            self.free_next[last as usize].store(head, Ordering::Relaxed);
+            let (head_idx, tag) = _unpack_pool_idx(head);
+            self.free_next[last as usize].store(head_idx, Ordering::Relaxed);
+
+            let new = _pack_pool_idx(first, 1 + tag);
+
             match self
                 .free_head
-                .compare_exchange(head, first, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(head, new, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => break,
+                Ok(_) => {
+                    self.wait_cdvr.notify_one();
+                    return;
+                }
                 Err(h) => head = h,
             }
         }
-
-        self.wait_cdvr.notify_one();
     }
 
     #[inline]
@@ -499,6 +531,96 @@ mod tests {
 
             // again, not the same pointer
             assert_ne!(pc, pd);
+        }
+    }
+
+    mod multi_alloc_and_free {
+        use super::*;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        #[test]
+        fn alloc_and_free_cycle() {
+            let n = 0x10;
+            let pool = BufPool::new(n as u32, 0x10);
+
+            let slot = pool.alloc_n(n);
+            assert_eq!(slot.count, n);
+
+            let slot2 = pool.alloc_n(n);
+            assert_eq!(slot2.count, 0);
+
+            pool.free_n(&slot.slots);
+
+            let slot3 = pool.alloc_n(n);
+            assert_eq!(slot3.count, n);
+        }
+
+        #[test]
+        fn alloc_n_partial_and_full() {
+            let pool = BufPool::new(8, 8);
+
+            let b1 = pool.alloc_n(5);
+            assert_eq!(b1.count, 5);
+
+            let b2 = pool.alloc_n(4);
+            assert_eq!(b2.count, 3);
+            assert!(pool.alloc().is_none());
+
+            pool.free_n(&b1.slots);
+            pool.free_n(&b2.slots);
+
+            let b3 = pool.alloc_n(4);
+            assert_eq!(b3.count, 4);
+        }
+
+        #[test]
+        fn no_duplicate_slots_alloc_n() {
+            let pool = BufPool::new(8, 8);
+
+            let b = pool.alloc_n(8);
+            let mut ptrs: Vec<_> = b.slots.iter().map(|s| s.ptr()).collect();
+
+            ptrs.sort();
+            ptrs.dedup();
+
+            assert_eq!(ptrs.len(), 8);
+        }
+
+        #[test]
+        fn stress_alloc_free_with_multi_threads() {
+            const THREADS: usize = 8;
+            const ITERS: usize = 0x2000;
+
+            let pool = Arc::new(BufPool::new(0x10, 8));
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            let mut handles = Vec::new();
+
+            for _ in 0..THREADS {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+
+                    for _ in 0..ITERS {
+                        let batch = pool.alloc_n(4);
+                        if batch.count > 0 {
+                            pool.free_n(&batch.slots);
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().expect("join in");
+            }
+
+            let fnl = pool.alloc_n(0x10);
+            assert_eq!(fnl.count, 0x10);
         }
     }
 }
