@@ -619,6 +619,7 @@ mod tests {
                 h.join().expect("join in");
             }
 
+            // alloc after stress
             let fnl = pool.alloc_n(0x10);
             assert_eq!(fnl.count, 0x10);
         }
