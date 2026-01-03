@@ -11,6 +11,9 @@ mod pool;
 #[allow(unused)]
 mod hints;
 
+#[allow(unused)]
+mod file;
+
 pub use errors::{GraveError, GraveResult};
 
 /// A page based storage engine with fire-and-forget writes and crash-safe durability semantics
