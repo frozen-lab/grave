@@ -3,14 +3,15 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![doc = include_str!("../README.md")]
 
+mod errors;
+
 #[allow(unused)]
 mod pool;
 
 #[allow(unused)]
-mod errors;
-
-#[allow(unused)]
 mod hints;
+
+pub use errors::{GraveError, GraveResult};
 
 /// A page based storage engine with fire-and-forget writes and crash-safe durability semantics
 ///
