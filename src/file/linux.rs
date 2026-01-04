@@ -1,7 +1,7 @@
 use crate::errors::{GraveError, GraveResult};
 use libc::{
-    c_int, c_void, close, fdatasync, fstat, ftruncate, off_t, open, pread, pwrite, size_t, stat, EPERM, O_CLOEXEC,
-    O_CREAT, O_NOATIME, O_RDWR, O_TRUNC,
+    c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, pread, pwrite, pwritev, size_t, stat, EPERM,
+    O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC,
 };
 use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
 
@@ -79,50 +79,15 @@ impl File {
         Ok(())
     }
 
-    /// Positional read from [`File`]
-    pub(crate) unsafe fn pread(&self, off: usize, buf_size: usize) -> GraveResult<Vec<u8>> {
-        let mut done = 0usize;
-        let mut buf = vec![0u8; buf_size];
-
-        let ptr = buf.as_mut_ptr();
-        while done < buf_size {
-            let res = pread(
-                self.fd(),
-                ptr.add(done) as *mut c_void,
-                (buf_size - done) as size_t,
-                (off + done) as i64,
-            );
-
-            if res == 0 {
-                return Err(GraveError::IO("unexpected EOF during pread".into()));
-            }
-
-            if res < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(err.into());
-            }
-
-            done += res as usize;
-        }
-
-        Ok(buf)
-    }
-
     /// Positional write to [`File`]
-    pub(crate) unsafe fn pwrite(&self, off: usize, buf: &[u8]) -> GraveResult<()> {
-        let ptr = buf.as_ptr();
-        let count = buf.len() as size_t;
-
-        let mut done = 0usize;
-        while done < count {
+    pub(crate) unsafe fn pwrite(&self, ptr: *const u8, off: usize, page_size: usize) -> GraveResult<()> {
+        let mut written = 0usize;
+        while written < page_size {
             let res = pwrite(
                 self.fd(),
-                ptr.add(done) as *const c_void,
-                (count - done) as size_t,
-                (off + done) as i64,
+                ptr.add(written) as *const c_void,
+                (page_size - written) as size_t,
+                (off + written) as i64,
             );
 
             if res < 0 {
@@ -138,7 +103,92 @@ impl File {
                 return Err(GraveError::IO("unexpected EOF during pwrite".into()));
             }
 
-            done += res as usize;
+            written += res as usize;
+        }
+
+        Ok(())
+    }
+
+    /// Positional read from [`File`]
+    pub(crate) unsafe fn pread(&self, ptr: *mut u8, off: usize, len: usize) -> GraveResult<()> {
+        let mut read = 0usize;
+        while read < len {
+            let res = pread(
+                self.fd(),
+                ptr.add(read) as *mut c_void,
+                (len - read) as size_t,
+                (off + read) as i64,
+            );
+
+            if res == 0 {
+                return Err(GraveError::IO("unexpected EOF during pread".into()));
+            }
+
+            if res < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+
+            read += res as usize;
+        }
+
+        Ok(())
+    }
+
+    /// Positional vectored write to [`File`]
+    pub(super) unsafe fn pwritev(&self, ptrs: &[*mut u8], off: usize, page_size: usize) -> GraveResult<()> {
+        let nptrs = ptrs.len();
+        let total_len = nptrs * page_size;
+        let mut iovecs: Vec<iovec> = ptrs
+            .iter()
+            .map(|ptr| iovec {
+                iov_base: *ptr as *mut c_void,
+                iov_len: page_size,
+            })
+            .collect();
+
+        let mut written = 0usize;
+        while written < total_len {
+            let res = pwritev(
+                self.fd(),
+                iovecs.as_ptr(),
+                iovecs.len() as c_int,
+                (off + written) as off_t,
+            );
+
+            if res < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+
+            if res == 0 {
+                return Err(GraveError::IO("unexpected EOF during pwritev".into()));
+            }
+
+            // NOTE: In posix systems, pwritev may write fewer bytes than requested, stop mid iovec
+            // or in-between iovec. Even though this behavior is situation/filesystem dependent,
+            // we must handle it for correctness across different systems
+
+            let mut remaining = res as usize;
+            while remaining > 0 {
+                let current_iov = &mut iovecs[0];
+                if remaining >= current_iov.iov_len {
+                    remaining -= current_iov.iov_len;
+                    written += current_iov.iov_len;
+                    iovecs.remove(0);
+                } else {
+                    current_iov.iov_base = (current_iov.iov_base as *mut u8).add(remaining) as *mut c_void;
+                    current_iov.iov_len -= remaining;
+                    written += remaining;
+                    remaining = 0;
+                }
+            }
         }
 
         Ok(())
