@@ -4,6 +4,8 @@ use crate::GraveResult;
 mod linux;
 
 pub(crate) struct GraveFile {
+    page_size: usize,
+
     #[cfg(target_os = "linux")]
     file: linux::File,
 
@@ -25,24 +27,24 @@ impl std::fmt::Display for GraveFile {
 }
 
 impl GraveFile {
-    pub(crate) fn new(path: &std::path::PathBuf) -> GraveResult<Self> {
+    pub(crate) fn new(path: &std::path::PathBuf, page_size: usize) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let file = ();
 
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::File::new(path) }?;
 
-        Ok(Self { file })
+        Ok(Self { file, page_size })
     }
 
-    pub(crate) fn open(path: &std::path::PathBuf) -> GraveResult<Self> {
+    pub(crate) fn open(path: &std::path::PathBuf, page_size: usize) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let file = ();
 
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::File::open(path) }?;
 
-        Ok(Self { file })
+        Ok(Self { file, page_size })
     }
 
     #[cfg(target_os = "linux")]
@@ -87,6 +89,39 @@ impl GraveFile {
         #[cfg(target_os = "linux")]
         unsafe {
             self.file.len()
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn read(&self, ptr: *mut u8, off: usize, npages: usize) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.file.pread(ptr, off, npages * self.page_size)
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn write(&self, ptr: *const u8, off: usize) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.file.pwrite(ptr, off, self.page_size)
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn writev(&self, ptr: &[*const u8], off: usize) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.file.pwritev(ptr, off, self.page_size)
         }
     }
 }

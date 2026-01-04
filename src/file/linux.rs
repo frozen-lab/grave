@@ -79,7 +79,38 @@ impl File {
         Ok(())
     }
 
+    /// Positional read from [`File`]
+    #[inline(always)]
+    pub(crate) unsafe fn pread(&self, ptr: *mut u8, off: usize, len: usize) -> GraveResult<()> {
+        let mut read = 0usize;
+        while read < len {
+            let res = pread(
+                self.fd(),
+                ptr.add(read) as *mut c_void,
+                (len - read) as size_t,
+                (off + read) as i64,
+            );
+
+            if res == 0 {
+                return Err(GraveError::IO("unexpected EOF during pread".into()));
+            }
+
+            if res < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+
+            read += res as usize;
+        }
+
+        Ok(())
+    }
+
     /// Positional write to [`File`]
+    #[inline(always)]
     pub(crate) unsafe fn pwrite(&self, ptr: *const u8, off: usize, page_size: usize) -> GraveResult<()> {
         let mut written = 0usize;
         while written < page_size {
@@ -109,37 +140,14 @@ impl File {
         Ok(())
     }
 
-    /// Positional read from [`File`]
-    pub(crate) unsafe fn pread(&self, ptr: *mut u8, off: usize, len: usize) -> GraveResult<()> {
-        let mut read = 0usize;
-        while read < len {
-            let res = pread(
-                self.fd(),
-                ptr.add(read) as *mut c_void,
-                (len - read) as size_t,
-                (off + read) as i64,
-            );
-
-            if res == 0 {
-                return Err(GraveError::IO("unexpected EOF during pread".into()));
-            }
-
-            if res < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(err.into());
-            }
-
-            read += res as usize;
-        }
-
-        Ok(())
-    }
-
     /// Positional vectored write to [`File`]
-    pub(super) unsafe fn pwritev(&self, ptrs: &[*mut u8], off: usize, page_size: usize) -> GraveResult<()> {
+    #[inline(always)]
+    pub(super) unsafe fn pwritev(&self, ptrs: &[*const u8], off: usize, page_size: usize) -> GraveResult<()> {
+        // sanity checks
+        debug_assert!(page_size > 0, "invalid page_size");
+        debug_assert!(!ptrs.is_empty(), "ptrs must never be empty");
+        debug_assert!(off % page_size != 0, "off is not page aligned");
+
         let nptrs = ptrs.len();
         let total_len = nptrs * page_size;
         let mut iovecs: Vec<iovec> = ptrs
@@ -176,18 +184,24 @@ impl File {
             // we must handle it for correctness across different systems
 
             let mut remaining = res as usize;
+            let mut idx = 0;
+
             while remaining > 0 {
                 let current_iov = &mut iovecs[0];
                 if remaining >= current_iov.iov_len {
-                    remaining -= current_iov.iov_len;
+                    idx += 1;
                     written += current_iov.iov_len;
-                    iovecs.remove(0);
+                    remaining -= current_iov.iov_len;
                 } else {
                     current_iov.iov_base = (current_iov.iov_base as *mut u8).add(remaining) as *mut c_void;
                     current_iov.iov_len -= remaining;
                     written += remaining;
                     remaining = 0;
                 }
+            }
+
+            if idx > 0 {
+                iovecs.drain(0..idx);
             }
         }
 
