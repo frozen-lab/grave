@@ -1,7 +1,7 @@
 use crate::errors::{GraveError, GraveResult};
 use libc::{
     c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, pread, pwrite, pwritev, size_t, stat, EPERM,
-    O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC,
+    O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
 };
 use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
 
@@ -146,7 +146,7 @@ impl File {
         // sanity checks
         debug_assert!(page_size > 0, "invalid page_size");
         debug_assert!(!ptrs.is_empty(), "ptrs must never be empty");
-        debug_assert!(off % page_size != 0, "off is not page aligned");
+        debug_assert!(off % page_size == 0, "off is not page aligned");
 
         let nptrs = ptrs.len();
         let total_len = nptrs * page_size;
@@ -187,7 +187,7 @@ impl File {
             let mut idx = 0;
 
             while remaining > 0 {
-                let current_iov = &mut iovecs[0];
+                let current_iov = &mut iovecs[idx];
                 if remaining >= current_iov.iov_len {
                     idx += 1;
                     written += current_iov.iov_len;
@@ -233,7 +233,16 @@ impl File {
     unsafe fn open_with_flags(path: &Path, flags: i32) -> GraveResult<i32> {
         let cpath = File::path_to_cstring(path)?;
 
-        let fd = open(cpath.as_ptr(), flags);
+        let fd = if flags & O_CREAT != 0 {
+            open(
+                cpath.as_ptr(),
+                flags,
+                S_IRUSR | S_IWUSR, // write + read permissions
+            )
+        } else {
+            open(cpath.as_ptr(), flags)
+        };
+
         if fd >= 0 {
             return Ok(fd);
         }
@@ -279,5 +288,261 @@ impl File {
 
     fn last_os_error<T>() -> GraveResult<T> {
         Err(std::io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn new_file_creation() {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        let file = unsafe { File::new(&tmp) };
+        assert!(file.is_ok());
+
+        let file = file.unwrap();
+        assert!(file.fd() >= 0);
+        unsafe { assert!(file.close().is_ok(), "failed to close file") }
+
+        // sanity check
+        assert!(tmp.exists(), "file must exists on the disk");
+    }
+
+    #[test]
+    fn open_accepts_existing_file() {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        // create file + sanity check
+        unsafe { assert!(File::new(&tmp).is_ok()) };
+        assert!(&tmp.exists(), "file must exists on the disk");
+
+        let file = unsafe { File::open(&tmp) };
+        assert!(file.is_ok());
+
+        let file = file.unwrap();
+        assert!(file.fd() >= 0);
+        unsafe { assert!(file.close().is_ok(), "failed to close file") }
+
+        // sanity check
+        assert!(tmp.exists(), "file must remain existing on the disk");
+    }
+
+    #[test]
+    fn open_fails_on_missing_file() {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        unsafe {
+            assert!(File::open(&tmp).is_err(), "open should fail on missing file");
+        }
+    }
+
+    #[test]
+    fn ftruncate_correctly_zero_extends_file() {
+        const LEN: usize = 0x20;
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        // create + zero_extend
+        let file = unsafe { File::new(&tmp).expect("new tmp file") };
+        unsafe { assert!(file.ftruncate(LEN).is_ok(), "ftruncate failed") }
+        unsafe { assert!(file.sync().is_ok(), "fdatasync failed") }
+
+        // validate by read
+        let file_contents = std::fs::read(&tmp).expect("read from file");
+
+        assert_eq!(file_contents.len(), LEN, "len mismatch for file");
+        assert!(
+            file_contents.iter().all(|b| *b == 0u8),
+            "file must be zero byte extended"
+        );
+
+        unsafe { assert!(file.close().is_ok(), "failed to close file") }
+    }
+
+    #[test]
+    fn open_preserves_existing_len() {
+        const LEN: usize = 0x20;
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        // create file + zero_extend + sanity check
+        unsafe {
+            let file = File::new(&tmp).expect("create new tmp file");
+            assert!(file.ftruncate(LEN).is_ok());
+            assert!(file.sync().is_ok());
+
+            assert!(file.close().is_ok(), "failed to close file");
+        }
+
+        let file = unsafe { File::open(&tmp).expect("open existing file") };
+        let file_len = unsafe { file.len().expect("read file len") };
+
+        assert_eq!(file_len, LEN, "open must preserve length of the file");
+        unsafe { assert!(file.close().is_ok(), "failed to close file") }
+    }
+
+    #[test]
+    fn close_fails_after_file_is_closed() {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        unsafe {
+            let file = File::new(&tmp).expect("open existing file");
+            assert!(file.close().is_ok(), "failed to close the file");
+            assert!(file.close().is_err(), "should fail after file is closed");
+        }
+    }
+
+    mod pread_pwrite {
+        use super::*;
+
+        #[test]
+        fn write_read_cycle() {
+            const PAGE_SIZE: usize = 0x20;
+            const DATA: [u8; PAGE_SIZE] = [0x1A; PAGE_SIZE];
+
+            let dir = tempdir().expect("temp dir");
+            let tmp = dir.path().join("tmp_file");
+
+            unsafe {
+                let file = File::new(&tmp).expect("open existing file");
+
+                // write
+                assert!(file.pwrite(DATA.as_ptr(), 0, PAGE_SIZE).is_ok(), "pwrite failed");
+                assert!(file.sync().is_ok(), "fdatasync failed");
+
+                // len validation
+                let len = file.len().expect("read len for file");
+                assert_eq!(len, PAGE_SIZE, "file len does not match expected len");
+
+                // readback
+                let mut buf = vec![0u8; PAGE_SIZE];
+                assert!(file.pread(buf.as_mut_ptr(), 0, PAGE_SIZE).is_ok(), "pread failed");
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
+
+        #[test]
+        fn write_read_cycle_across_sessions() {
+            const PAGE_SIZE: usize = 0x40;
+            const DATA: [u8; PAGE_SIZE] = [0x1C; PAGE_SIZE];
+
+            let dir = tempdir().expect("temp dir");
+            let tmp = dir.path().join("tmp_file");
+
+            // create + write + sync + close
+            unsafe {
+                let file = File::new(&tmp).expect("open existing file");
+
+                assert!(file.pwrite(DATA.as_ptr(), 0, PAGE_SIZE).is_ok(), "pwrite failed");
+                assert!(file.sync().is_ok(), "fdatasync failed");
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+
+            // open + read + close
+            unsafe {
+                let file = File::open(&tmp).expect("open existing file");
+
+                // len validation
+                let len = file.len().expect("read len for file");
+                assert_eq!(len, PAGE_SIZE, "file len does not match expected len");
+
+                // readback
+                let mut buf = vec![0u8; PAGE_SIZE];
+                assert!(file.pread(buf.as_mut_ptr(), 0, PAGE_SIZE).is_ok(), "pread failed");
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
+    }
+
+    mod pwritev_pread {
+        use super::*;
+
+        #[test]
+        fn write_read_cycle() {
+            const PAGE_SIZE: usize = 0x20;
+            const DATA: [u8; PAGE_SIZE] = [0x1A; PAGE_SIZE];
+
+            let dir = tempdir().expect("temp dir");
+            let tmp = dir.path().join("tmp_file");
+
+            let ptrs = vec![DATA.as_ptr(); 0x10];
+            let total_len = ptrs.len() * PAGE_SIZE;
+
+            unsafe {
+                let file = File::new(&tmp).expect("open existing file");
+
+                // write
+                assert!(file.pwritev(&ptrs, 0, PAGE_SIZE).is_ok(), "pwritev failed");
+                assert!(file.sync().is_ok(), "fdatasync failed");
+
+                // len validation
+                let len = file.len().expect("read len for file");
+                assert_eq!(len, total_len, "file len does not match expected len");
+
+                let mut buf = vec![0u8; total_len];
+                assert!(file.pread(buf.as_mut_ptr(), 0, total_len).is_ok(), "pread failed");
+                assert_eq!(buf.len(), total_len, "mismatch between read and write");
+
+                for chunk in buf.chunks_exact(PAGE_SIZE) {
+                    assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
+                }
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
+
+        #[test]
+        fn write_read_cycle_across_sessions() {
+            const PAGE_SIZE: usize = 0x20;
+            const DATA: [u8; PAGE_SIZE] = [0x1A; PAGE_SIZE];
+
+            let dir = tempdir().expect("temp dir");
+            let tmp = dir.path().join("tmp_file");
+
+            let ptrs = vec![DATA.as_ptr(); 0x10];
+            let total_len = ptrs.len() * PAGE_SIZE;
+
+            // create + write + sync + close
+            unsafe {
+                let file = File::new(&tmp).expect("open existing file");
+
+                assert!(file.pwritev(&ptrs, 0, PAGE_SIZE).is_ok(), "pwritev failed");
+                assert!(file.sync().is_ok(), "fdatasync failed");
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+
+            // open + read + close
+            unsafe {
+                let file = File::open(&tmp).expect("open existing file");
+
+                // len validation
+                let len = file.len().expect("read len for file");
+                assert_eq!(len, total_len, "file len does not match expected len");
+
+                // readback
+                let mut buf = vec![0u8; total_len];
+                assert!(file.pread(buf.as_mut_ptr(), 0, total_len).is_ok(), "pread failed");
+                assert_eq!(buf.len(), total_len, "mismatch between read and write");
+
+                for chunk in buf.chunks_exact(PAGE_SIZE) {
+                    assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
+                }
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
     }
 }
