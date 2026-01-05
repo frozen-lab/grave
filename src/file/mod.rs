@@ -125,3 +125,223 @@ impl GraveFile {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    const PAGE_SIZE: usize = 0x20;
+
+    #[test]
+    fn new_file_creation() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("tmp_file");
+
+        let file = GraveFile::new(&path, PAGE_SIZE).expect("create new file");
+        assert_eq!(file.len().expect("read file len"), 0);
+
+        assert!(file.close().is_ok(), "failed to close file");
+        assert!(path.exists(), "file must exist on disk");
+    }
+
+    #[test]
+    fn open_accepts_existing_file() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("tmp_file");
+
+        {
+            let file = GraveFile::new(&path, PAGE_SIZE).expect("create new file");
+            assert!(file.close().is_ok(), "failed to close file");
+        }
+
+        let file = GraveFile::open(&path, PAGE_SIZE).expect("open existing file");
+        assert_eq!(file.len().expect("read file len"), 0);
+
+        assert!(file.close().is_ok(), "failed to close file");
+    }
+
+    #[test]
+    fn open_fails_on_missing_file() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("missing_file");
+
+        assert!(
+            GraveFile::open(&path, PAGE_SIZE).is_err(),
+            "open must fail for missing file"
+        );
+    }
+
+    #[test]
+    fn zero_extend_correctly_extends_file() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("tmp_file");
+
+        let file = GraveFile::new(&path, PAGE_SIZE).expect("create new file");
+        assert!(file.zero_extend(PAGE_SIZE * 2).is_ok(), "zero_extend failed");
+        assert!(file.sync().is_ok(), "fdatasync failed");
+
+        assert_eq!(file.len().expect("read file len"), PAGE_SIZE * 2, "file len mismatch");
+        assert!(file.close().is_ok(), "failed to close file");
+
+        let data = std::fs::read(&path).expect("read file");
+        assert!(data.iter().all(|b| *b == 0), "file must be zero extended");
+    }
+
+    #[test]
+    fn close_fails_after_close() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("tmp_file");
+
+        let file = GraveFile::new(&path, PAGE_SIZE).expect("create new file");
+        assert!(file.close().is_ok(), "failed to close file");
+        assert!(file.close().is_err(), "close must fail after close");
+    }
+
+    mod write_read {
+        use super::*;
+
+        #[test]
+        fn write_read_cycle() {
+            const PAGE_SIZE: usize = 0x20;
+            const DATA: [u8; PAGE_SIZE] = [0x1A; PAGE_SIZE];
+
+            let dir = tempdir().expect("temp dir");
+            let tmp = dir.path().join("tmp_file");
+
+            unsafe {
+                let file = GraveFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+
+                // write
+                assert!(file.write(DATA.as_ptr(), 0).is_ok(), "pwrite failed");
+                assert!(file.sync().is_ok(), "fdatasync failed");
+
+                // len validation
+                let len = file.len().expect("read len for file");
+                assert_eq!(len, PAGE_SIZE, "file len does not match expected len");
+
+                // readback
+                let mut buf = vec![0u8; PAGE_SIZE];
+                assert!(file.read(buf.as_mut_ptr(), 0, 1).is_ok(), "pread failed");
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
+
+        #[test]
+        fn write_read_cycle_across_sessions() {
+            const PAGE_SIZE: usize = 0x40;
+            const DATA: [u8; PAGE_SIZE] = [0x1C; PAGE_SIZE];
+
+            let dir = tempdir().expect("temp dir");
+            let tmp = dir.path().join("tmp_file");
+
+            // create + write + sync + close
+            unsafe {
+                let file = GraveFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+
+                assert!(file.write(DATA.as_ptr(), 0).is_ok(), "pwrite failed");
+                assert!(file.sync().is_ok(), "fdatasync failed");
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+
+            // open + read + close
+            unsafe {
+                let file = GraveFile::open(&tmp, PAGE_SIZE).expect("open existing file");
+
+                // len validation
+                let len = file.len().expect("read len for file");
+                assert_eq!(len, PAGE_SIZE, "file len does not match expected len");
+
+                // readback
+                let mut buf = vec![0u8; PAGE_SIZE];
+                assert!(file.read(buf.as_mut_ptr(), 0, 1).is_ok(), "pread failed");
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
+    }
+
+    mod writev_read {
+        use super::*;
+
+        #[test]
+        fn write_read_cycle() {
+            const PAGE_SIZE: usize = 0x20;
+            const DATA: [u8; PAGE_SIZE] = [0x1A; PAGE_SIZE];
+
+            let dir = tempdir().expect("temp dir");
+            let tmp = dir.path().join("tmp_file");
+
+            let ptrs = vec![DATA.as_ptr(); 0x10];
+            let total_len = ptrs.len() * PAGE_SIZE;
+
+            unsafe {
+                let file = GraveFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+
+                // write
+                assert!(file.writev(&ptrs, 0).is_ok(), "pwritev failed");
+                assert!(file.sync().is_ok(), "fdatasync failed");
+
+                // len validation
+                let len = file.len().expect("read len for file");
+                assert_eq!(len, total_len, "file len does not match expected len");
+
+                let mut buf = vec![0u8; total_len];
+                assert!(file.read(buf.as_mut_ptr(), 0, ptrs.len()).is_ok(), "pread failed");
+                assert_eq!(buf.len(), total_len, "mismatch between read and write");
+
+                for chunk in buf.chunks_exact(PAGE_SIZE) {
+                    assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
+                }
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
+
+        #[test]
+        fn write_read_cycle_across_sessions() {
+            const PAGE_SIZE: usize = 0x20;
+            const DATA: [u8; PAGE_SIZE] = [0x1A; PAGE_SIZE];
+
+            let dir = tempdir().expect("temp dir");
+            let tmp = dir.path().join("tmp_file");
+
+            let ptrs = vec![DATA.as_ptr(); 0x10];
+            let total_len = ptrs.len() * PAGE_SIZE;
+
+            // create + write + sync + close
+            unsafe {
+                let file = GraveFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+
+                assert!(file.writev(&ptrs, 0).is_ok(), "pwritev failed");
+                assert!(file.sync().is_ok(), "fdatasync failed");
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+
+            // open + read + close
+            unsafe {
+                let file = GraveFile::open(&tmp, PAGE_SIZE).expect("open existing file");
+
+                // len validation
+                let len = file.len().expect("read len for file");
+                assert_eq!(len, total_len, "file len does not match expected len");
+
+                // readback
+                let mut buf = vec![0u8; total_len];
+                assert!(file.read(buf.as_mut_ptr(), 0, ptrs.len()).is_ok(), "pread failed");
+                assert_eq!(buf.len(), total_len, "mismatch between read and write");
+
+                for chunk in buf.chunks_exact(PAGE_SIZE) {
+                    assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
+                }
+
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
+    }
+}

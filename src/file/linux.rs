@@ -399,7 +399,7 @@ mod tests {
         }
     }
 
-    mod pread_pwrite {
+    mod pwrite_pread {
         use super::*;
 
         #[test]
