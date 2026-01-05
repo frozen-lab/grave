@@ -344,4 +344,115 @@ mod tests {
             }
         }
     }
+
+    mod concurrent_write_read {
+        use super::*;
+        use std::sync::Arc;
+        use std::thread;
+
+        #[test]
+        fn concurrent_writes_to_disjoint_offsets() {
+            const PAGE_SIZE: usize = 0x20;
+            const NTHREADS: usize = 8;
+
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("tmp_file");
+            let file = Arc::new(GraveFile::new(&path, PAGE_SIZE).expect("create new file"));
+
+            let mut handles = Vec::with_capacity(NTHREADS);
+            for i in 0..NTHREADS {
+                let file = Arc::clone(&file);
+                handles.push(thread::spawn(move || {
+                    let data = vec![i as u8; PAGE_SIZE];
+                    let off = i * PAGE_SIZE;
+                    assert!(file.write(data.as_ptr(), off).is_ok(), "concurrent write failed");
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok(), "thread panicked");
+            }
+
+            assert!(file.sync().is_ok(), "fdatasync failed");
+
+            let len = file.len().expect("read file len");
+            assert_eq!(len, NTHREADS * PAGE_SIZE, "file len mismatch");
+
+            let mut buf = vec![0u8; len];
+            assert!(file.read(buf.as_mut_ptr(), 0, NTHREADS).is_ok(), "read failed");
+
+            for (i, chunk) in buf.chunks_exact(PAGE_SIZE).enumerate() {
+                assert!(
+                    chunk.iter().all(|b| *b == i as u8),
+                    "data corruption in concurrent write"
+                );
+            }
+
+            assert!(file.close().is_ok(), "failed to close file");
+        }
+
+        #[test]
+        fn concurrent_reads_after_write() {
+            const PAGE_SIZE: usize = 0x20;
+            const NTHREADS: usize = 4;
+
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("tmp_file");
+            let file = Arc::new(GraveFile::new(&path, PAGE_SIZE).expect("create new file"));
+
+            let data = vec![0xABu8; PAGE_SIZE];
+            assert!(file.write(data.as_ptr(), 0).is_ok(), "initial write failed");
+            assert!(file.sync().is_ok(), "fdatasync failed");
+
+            let mut handles = Vec::with_capacity(NTHREADS);
+            for _ in 0..NTHREADS {
+                let file = Arc::clone(&file);
+                handles.push(thread::spawn(move || {
+                    let mut buf = vec![0u8; PAGE_SIZE];
+                    assert!(file.read(buf.as_mut_ptr(), 0, 1).is_ok(), "concurrent read failed");
+                    assert_eq!(buf, vec![0xABu8; PAGE_SIZE], "read data mismatch");
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok(), "thread panicked");
+            }
+
+            assert!(file.close().is_ok(), "failed to close file");
+        }
+
+        #[test]
+        fn concurrent_writev_and_reads() {
+            const PAGE_SIZE: usize = 0x20;
+            const NPAGES: usize = 4;
+
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("tmp_file");
+            let file = Arc::new(GraveFile::new(&path, PAGE_SIZE).expect("create new file"));
+
+            let pages: Vec<Vec<u8>> = (0..NPAGES).map(|i| vec![i as u8; PAGE_SIZE]).collect();
+            let ptrs: Vec<*const u8> = pages.iter().map(|p| p.as_ptr()).collect();
+
+            assert!(file.writev(&ptrs, 0).is_ok(), "writev failed");
+            assert!(file.sync().is_ok(), "fdatasync failed");
+
+            let mut handles = Vec::with_capacity(NPAGES);
+            for i in 0..NPAGES {
+                let file = Arc::clone(&file);
+                handles.push(thread::spawn(move || {
+                    let mut buf = vec![0u8; PAGE_SIZE];
+                    let off = i * PAGE_SIZE;
+
+                    assert!(file.read(buf.as_mut_ptr(), off, 1).is_ok(), "read failed");
+                    assert!(buf.iter().all(|b| *b == i as u8), "data mismatch in concurrent read");
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok(), "thread panicked");
+            }
+
+            assert!(file.close().is_ok(), "failed to close file");
+        }
+    }
 }
