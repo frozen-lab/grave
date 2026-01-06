@@ -20,6 +20,9 @@ mod file;
 #[allow(unused)]
 mod mmap;
 
+#[allow(unused)]
+mod index;
+
 pub use cfg::{GraveConfig, GraveConfigValue};
 pub use errors::{GraveError, GraveResult};
 
@@ -43,8 +46,11 @@ unsafe impl Send for Grave {}
 unsafe impl Sync for Grave {}
 
 impl Grave {
-    ///
     pub fn new<P: AsRef<std::path::PathBuf>>(dirpath: P, cfg: GraveConfig) -> GraveResult<Self> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
         Self::prep_directory(dirpath.as_ref())?;
 
         Ok(Self {
@@ -53,23 +59,41 @@ impl Grave {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn prep_directory(dirpath: &std::path::PathBuf) -> GraveResult<()> {
-        if dirpath.exists() {
-            if dirpath.is_dir() {
-                return Ok(());
-            }
+        use libc::{faccessat, O_DIRECTORY, R_OK, W_OK};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
 
+        // S1: create directory if missing
+        match std::fs::create_dir(dirpath) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        // S2: open directory
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECTORY)
+            .open(dirpath)?;
+
+        // S3: validate metadata
+        let metadata = dir.metadata()?;
+        if !metadata.is_dir() {
             return Err(GraveError::IO(format!(
                 "Failed to init Grave, as path={:?} is not a directory",
                 dirpath
             )));
         }
 
-        std::fs::create_dir_all(dirpath).map_err(|e| {
-            GraveError::IO(format!(
-                "Failed to init Grave, as following error occurred while creating a directory, error: {e}"
-            ))
-        })
+        // S4: write/read perm check
+        let ret = unsafe { faccessat(dir.as_raw_fd(), b".\0".as_ptr() as _, R_OK | W_OK, 0) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        Ok(())
     }
 }
 
@@ -102,7 +126,15 @@ mod tests {
             let dir = tmp.path().join("dummy");
             std::fs::create_dir_all(&dir).expect("create new directory");
 
-            assert!(Grave::prep_directory(&dir).is_ok(), "Should open existing dir");
+            assert!(
+                Grave::prep_directory(&dir)
+                    .map_err(|e| {
+                        eprintln!("{:?}", e);
+                        e
+                    })
+                    .is_ok(),
+                "Should open existing dir"
+            );
 
             // sanity checks for validity
             assert!(dir.exists(), "New directory should be created");
