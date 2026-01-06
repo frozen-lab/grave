@@ -5,8 +5,6 @@ mod linux;
 
 #[derive(Debug)]
 pub(crate) struct OsFile {
-    page_size: usize,
-
     #[cfg(target_os = "linux")]
     file: linux::File,
 
@@ -28,24 +26,24 @@ impl std::fmt::Display for OsFile {
 }
 
 impl OsFile {
-    pub(crate) fn new(path: &std::path::PathBuf, page_size: usize) -> GraveResult<Self> {
+    pub(crate) fn new(path: &std::path::PathBuf) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let file = ();
 
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::File::new(path) }?;
 
-        Ok(Self { file, page_size })
+        Ok(Self { file })
     }
 
-    pub(crate) fn open(path: &std::path::PathBuf, page_size: usize) -> GraveResult<Self> {
+    pub(crate) fn open(path: &std::path::PathBuf) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let file = ();
 
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::File::open(path) }?;
 
-        Ok(Self { file, page_size })
+        Ok(Self { file })
     }
 
     #[cfg(target_os = "linux")]
@@ -94,35 +92,35 @@ impl OsFile {
     }
 
     #[inline(always)]
-    pub(crate) fn read(&self, ptr: *mut u8, off: usize, npages: usize) -> GraveResult<()> {
+    pub(crate) fn read(&self, ptr: *mut u8, off: usize, len: usize) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.pread(ptr, off, npages * self.page_size)
+            self.file.pread(ptr, off, len)
         }
     }
 
     #[inline(always)]
-    pub(crate) fn write(&self, ptr: *const u8, off: usize) -> GraveResult<()> {
+    pub(crate) fn write(&self, ptr: *const u8, off: usize, page_size: usize) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.pwrite(ptr, off, self.page_size)
+            self.file.pwrite(ptr, off, page_size)
         }
     }
 
     #[inline(always)]
-    pub(crate) fn writev(&self, ptr: &[*const u8], off: usize) -> GraveResult<()> {
+    pub(crate) fn writev(&self, ptr: &[*const u8], off: usize, page_size: usize) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.pwritev(ptr, off, self.page_size)
+            self.file.pwritev(ptr, off, page_size)
         }
     }
 }
@@ -139,7 +137,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("tmp_file");
 
-        let file = OsFile::new(&path, PAGE_SIZE).expect("create new file");
+        let file = OsFile::new(&path).expect("create new file");
         assert_eq!(file.len().expect("read file len"), 0);
 
         assert!(file.close().is_ok(), "failed to close file");
@@ -152,11 +150,11 @@ mod tests {
         let path = dir.path().join("tmp_file");
 
         {
-            let file = OsFile::new(&path, PAGE_SIZE).expect("create new file");
+            let file = OsFile::new(&path).expect("create new file");
             assert!(file.close().is_ok(), "failed to close file");
         }
 
-        let file = OsFile::open(&path, PAGE_SIZE).expect("open existing file");
+        let file = OsFile::open(&path).expect("open existing file");
         assert_eq!(file.len().expect("read file len"), 0);
 
         assert!(file.close().is_ok(), "failed to close file");
@@ -167,10 +165,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("missing_file");
 
-        assert!(
-            OsFile::open(&path, PAGE_SIZE).is_err(),
-            "open must fail for missing file"
-        );
+        assert!(OsFile::open(&path).is_err(), "open must fail for missing file");
     }
 
     #[test]
@@ -178,7 +173,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("tmp_file");
 
-        let file = OsFile::new(&path, PAGE_SIZE).expect("create new file");
+        let file = OsFile::new(&path).expect("create new file");
         assert!(file.zero_extend(PAGE_SIZE * 2).is_ok(), "zero_extend failed");
         assert!(file.sync().is_ok(), "fdatasync failed");
 
@@ -194,7 +189,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("tmp_file");
 
-        let file = OsFile::new(&path, PAGE_SIZE).expect("create new file");
+        let file = OsFile::new(&path).expect("create new file");
         assert!(file.close().is_ok(), "failed to close file");
         assert!(file.close().is_err(), "close must fail after close");
     }
@@ -211,10 +206,10 @@ mod tests {
             let tmp = dir.path().join("tmp_file");
 
             unsafe {
-                let file = OsFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::new(&tmp).expect("open existing file");
 
                 // write
-                assert!(file.write(DATA.as_ptr(), 0).is_ok(), "pwrite failed");
+                assert!(file.write(DATA.as_ptr(), 0, PAGE_SIZE).is_ok(), "pwrite failed");
                 assert!(file.sync().is_ok(), "fdatasync failed");
 
                 // len validation
@@ -223,7 +218,7 @@ mod tests {
 
                 // readback
                 let mut buf = vec![0u8; PAGE_SIZE];
-                assert!(file.read(buf.as_mut_ptr(), 0, 1).is_ok(), "pread failed");
+                assert!(file.read(buf.as_mut_ptr(), 0, PAGE_SIZE).is_ok(), "pread failed");
                 assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
 
                 assert!(file.close().is_ok(), "failed to close the file");
@@ -240,9 +235,9 @@ mod tests {
 
             // create + write + sync + close
             unsafe {
-                let file = OsFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::new(&tmp).expect("open existing file");
 
-                assert!(file.write(DATA.as_ptr(), 0).is_ok(), "pwrite failed");
+                assert!(file.write(DATA.as_ptr(), 0, PAGE_SIZE).is_ok(), "pwrite failed");
                 assert!(file.sync().is_ok(), "fdatasync failed");
 
                 assert!(file.close().is_ok(), "failed to close the file");
@@ -250,7 +245,7 @@ mod tests {
 
             // open + read + close
             unsafe {
-                let file = OsFile::open(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::open(&tmp).expect("open existing file");
 
                 // len validation
                 let len = file.len().expect("read len for file");
@@ -258,7 +253,7 @@ mod tests {
 
                 // readback
                 let mut buf = vec![0u8; PAGE_SIZE];
-                assert!(file.read(buf.as_mut_ptr(), 0, 1).is_ok(), "pread failed");
+                assert!(file.read(buf.as_mut_ptr(), 0, PAGE_SIZE).is_ok(), "pread failed");
                 assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
 
                 assert!(file.close().is_ok(), "failed to close the file");
@@ -281,10 +276,10 @@ mod tests {
             let total_len = ptrs.len() * PAGE_SIZE;
 
             unsafe {
-                let file = OsFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::new(&tmp).expect("open existing file");
 
                 // write
-                assert!(file.writev(&ptrs, 0).is_ok(), "pwritev failed");
+                assert!(file.writev(&ptrs, 0, PAGE_SIZE).is_ok(), "pwritev failed");
                 assert!(file.sync().is_ok(), "fdatasync failed");
 
                 // len validation
@@ -292,7 +287,7 @@ mod tests {
                 assert_eq!(len, total_len, "file len does not match expected len");
 
                 let mut buf = vec![0u8; total_len];
-                assert!(file.read(buf.as_mut_ptr(), 0, ptrs.len()).is_ok(), "pread failed");
+                assert!(file.read(buf.as_mut_ptr(), 0, total_len).is_ok(), "pread failed");
                 assert_eq!(buf.len(), total_len, "mismatch between read and write");
 
                 for chunk in buf.chunks_exact(PAGE_SIZE) {
@@ -316,9 +311,9 @@ mod tests {
 
             // create + write + sync + close
             unsafe {
-                let file = OsFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::new(&tmp).expect("open existing file");
 
-                assert!(file.writev(&ptrs, 0).is_ok(), "pwritev failed");
+                assert!(file.writev(&ptrs, 0, PAGE_SIZE).is_ok(), "pwritev failed");
                 assert!(file.sync().is_ok(), "fdatasync failed");
 
                 assert!(file.close().is_ok(), "failed to close the file");
@@ -326,7 +321,7 @@ mod tests {
 
             // open + read + close
             unsafe {
-                let file = OsFile::open(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::open(&tmp).expect("open existing file");
 
                 // len validation
                 let len = file.len().expect("read len for file");
@@ -334,7 +329,7 @@ mod tests {
 
                 // readback
                 let mut buf = vec![0u8; total_len];
-                assert!(file.read(buf.as_mut_ptr(), 0, ptrs.len()).is_ok(), "pread failed");
+                assert!(file.read(buf.as_mut_ptr(), 0, total_len).is_ok(), "pread failed");
                 assert_eq!(buf.len(), total_len, "mismatch between read and write");
 
                 for chunk in buf.chunks_exact(PAGE_SIZE) {
@@ -358,7 +353,7 @@ mod tests {
 
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("tmp_file");
-            let file = Arc::new(OsFile::new(&path, PAGE_SIZE).expect("create new file"));
+            let file = Arc::new(OsFile::new(&path).expect("create new file"));
 
             let mut handles = Vec::with_capacity(NTHREADS);
             for i in 0..NTHREADS {
@@ -366,7 +361,10 @@ mod tests {
                 handles.push(thread::spawn(move || {
                     let data = vec![i as u8; PAGE_SIZE];
                     let off = i * PAGE_SIZE;
-                    assert!(file.write(data.as_ptr(), off).is_ok(), "concurrent write failed");
+                    assert!(
+                        file.write(data.as_ptr(), off, PAGE_SIZE).is_ok(),
+                        "concurrent write failed"
+                    );
                 }));
             }
 
@@ -380,7 +378,10 @@ mod tests {
             assert_eq!(len, NTHREADS * PAGE_SIZE, "file len mismatch");
 
             let mut buf = vec![0u8; len];
-            assert!(file.read(buf.as_mut_ptr(), 0, NTHREADS).is_ok(), "read failed");
+            assert!(
+                file.read(buf.as_mut_ptr(), 0, NTHREADS * PAGE_SIZE).is_ok(),
+                "read failed"
+            );
 
             for (i, chunk) in buf.chunks_exact(PAGE_SIZE).enumerate() {
                 assert!(
@@ -399,10 +400,10 @@ mod tests {
 
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("tmp_file");
-            let file = Arc::new(OsFile::new(&path, PAGE_SIZE).expect("create new file"));
+            let file = Arc::new(OsFile::new(&path).expect("create new file"));
 
             let data = vec![0xABu8; PAGE_SIZE];
-            assert!(file.write(data.as_ptr(), 0).is_ok(), "initial write failed");
+            assert!(file.write(data.as_ptr(), 0, PAGE_SIZE).is_ok(), "initial write failed");
             assert!(file.sync().is_ok(), "fdatasync failed");
 
             let mut handles = Vec::with_capacity(NTHREADS);
@@ -410,7 +411,10 @@ mod tests {
                 let file = Arc::clone(&file);
                 handles.push(thread::spawn(move || {
                     let mut buf = vec![0u8; PAGE_SIZE];
-                    assert!(file.read(buf.as_mut_ptr(), 0, 1).is_ok(), "concurrent read failed");
+                    assert!(
+                        file.read(buf.as_mut_ptr(), 0, PAGE_SIZE).is_ok(),
+                        "concurrent read failed"
+                    );
                     assert_eq!(buf, vec![0xABu8; PAGE_SIZE], "read data mismatch");
                 }));
             }
@@ -429,12 +433,12 @@ mod tests {
 
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("tmp_file");
-            let file = Arc::new(OsFile::new(&path, PAGE_SIZE).expect("create new file"));
+            let file = Arc::new(OsFile::new(&path).expect("create new file"));
 
             let pages: Vec<Vec<u8>> = (0..NPAGES).map(|i| vec![i as u8; PAGE_SIZE]).collect();
             let ptrs: Vec<*const u8> = pages.iter().map(|p| p.as_ptr()).collect();
 
-            assert!(file.writev(&ptrs, 0).is_ok(), "writev failed");
+            assert!(file.writev(&ptrs, 0, PAGE_SIZE).is_ok(), "writev failed");
             assert!(file.sync().is_ok(), "fdatasync failed");
 
             let mut handles = Vec::with_capacity(NPAGES);
@@ -444,7 +448,7 @@ mod tests {
                     let mut buf = vec![0u8; PAGE_SIZE];
                     let off = i * PAGE_SIZE;
 
-                    assert!(file.read(buf.as_mut_ptr(), off, 1).is_ok(), "read failed");
+                    assert!(file.read(buf.as_mut_ptr(), off, PAGE_SIZE).is_ok(), "read failed");
                     assert!(buf.iter().all(|b| *b == i as u8), "data mismatch in concurrent read");
                 }));
             }

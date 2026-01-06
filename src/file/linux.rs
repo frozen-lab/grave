@@ -112,6 +112,11 @@ impl File {
     /// Positional write to [`File`]
     #[inline(always)]
     pub(crate) unsafe fn pwrite(&self, ptr: *const u8, off: usize, page_size: usize) -> GraveResult<()> {
+        // sanity checks
+        debug_assert!(page_size > 0, "invalid page_size");
+        debug_assert!(!ptr.is_null(), "ptr must never be null");
+        debug_assert!(off % page_size == 0, "off is not page aligned");
+
         let mut written = 0usize;
         while written < page_size {
             let res = pwrite(

@@ -148,7 +148,7 @@ mod tests {
         let dir = tempdir().expect("tmp dir");
         let path = dir.path().join("tmp_memmap");
 
-        let file = OsFile::new(&path, PAGE_SIZE).expect("new file");
+        let file = OsFile::new(&path).expect("new file");
         file.zero_extend(len).expect("zero extend");
         file.sync().expect("sync");
         file
@@ -206,7 +206,7 @@ mod tests {
 
             // create_file + mmap + write + sync
             {
-                let file = OsFile::new(&path, PAGE_SIZE).expect("new");
+                let file = OsFile::new(&path).expect("new");
                 file.zero_extend(PAGE_SIZE).unwrap();
                 file.sync().expect("failed to sync");
 
@@ -220,7 +220,7 @@ mod tests {
 
             // open_file + mmap + read
             {
-                let file = OsFile::open(&path, PAGE_SIZE).expect("open");
+                let file = OsFile::open(&path).expect("open");
                 let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
 
                 let r = mmap.reader::<u64>(0);
@@ -245,7 +245,7 @@ mod tests {
             // read
             {
                 let mut buf = [0u8; 8];
-                file.read(buf.as_mut_ptr(), 0, 1).expect("failed to read");
+                file.read(buf.as_mut_ptr(), 0, 8).expect("failed to read");
                 assert_eq!(u64::from_le_bytes(buf), 0xDEAD_C0DE_DEAD_C0DE);
             }
 

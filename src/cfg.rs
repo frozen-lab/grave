@@ -23,7 +23,7 @@ pub enum GraveConfigValue {
 
 impl GraveConfigValue {
     #[inline]
-    pub(crate) const fn to_usize(&self) -> usize {
+    pub(crate) const fn to_u32(&self) -> u32 {
         match self {
             Self::N8 => 8,
             Self::N16 => 0x10,
