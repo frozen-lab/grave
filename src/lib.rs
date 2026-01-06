@@ -17,6 +17,9 @@ mod hints;
 #[allow(unused)]
 mod file;
 
+#[allow(unused)]
+mod mmap;
+
 pub use cfg::{GraveConfig, GraveConfigValue};
 pub use errors::{GraveError, GraveResult};
 
