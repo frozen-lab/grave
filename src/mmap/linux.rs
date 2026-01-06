@@ -115,3 +115,166 @@ impl MMap {
         Err(std::io::Error::last_os_error().into())
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::file::OsFile;
+    use tempfile::tempdir;
+
+    const PAGE: usize = 0x100;
+
+    fn tmp_file(len: usize) -> OsFile {
+        let dir = tempdir().expect("tmp dir");
+        let path = dir.path().join(&format!("test_mmap_{len}"));
+
+        unsafe {
+            let file = OsFile::new(&path, PAGE).expect("new file");
+            file.zero_extend(len).expect("set init len");
+            file.sync().expect("flush to disk");
+            file
+        }
+    }
+
+    #[test]
+    fn map_unmap_cycle() {
+        let file = tmp_file(PAGE);
+
+        let map = unsafe { MMap::map(file.fd(), PAGE) };
+        assert!(map.is_ok());
+
+        let map = map.unwrap();
+        assert_eq!(map.len, PAGE);
+        assert!(!map.ptr.is_null());
+
+        unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
+        assert!(file.close().is_ok(), "failed to close the file");
+    }
+
+    #[test]
+    fn map_fails_on_invalid_fd() {
+        let file = tmp_file(PAGE);
+        unsafe {
+            assert!(MMap::map(-1, PAGE).is_err());
+        }
+    }
+
+    #[test]
+    fn unmap_after_unmap_does_not_fails() {
+        let file = tmp_file(PAGE);
+
+        unsafe {
+            let map = MMap::map(file.fd(), PAGE).expect("new map");
+
+            assert!(map.unmap().is_ok(), "failed to unmap");
+            assert!(map.unmap().is_ok(), "should not fail");
+        }
+
+        assert!(file.close().is_ok(), "failed to close the file");
+    }
+
+    #[test]
+    fn sanity_check_for_sync() {
+        let file = tmp_file(PAGE);
+        let map = unsafe { MMap::map(file.fd(), PAGE).expect("new map") };
+
+        assert!(unsafe { map.sync().is_ok() }, "sync failed");
+
+        unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
+        assert!(file.close().is_ok(), "failed to close the file");
+    }
+
+    #[test]
+    fn sanity_check_for_async_sync() {
+        let file = tmp_file(PAGE);
+        let map = unsafe { MMap::map(file.fd(), PAGE).expect("new map") };
+
+        assert!(unsafe { map.async_sync().is_ok() }, "async sync failed");
+
+        unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
+        assert!(file.close().is_ok(), "failed to close the file");
+    }
+
+    mod write_read {
+        use super::*;
+
+        #[test]
+        fn write_read_cycle() {
+            let file = tmp_file(PAGE);
+            let map = unsafe { MMap::map(file.fd(), PAGE).expect("new map") };
+
+            // write + sync
+            unsafe {
+                let ptr = map.get_mut::<u64>(0);
+                *ptr = 0xDEAD_C0DE_DEAD_C0DE;
+                map.sync().expect("sync failed");
+            }
+
+            // read
+            unsafe {
+                let val = *map.get::<u64>(0);
+                assert_eq!(val, 0xDEAD_C0DE_DEAD_C0DE);
+            }
+
+            unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
+            assert!(file.close().is_ok(), "failed to close the file");
+        }
+
+        #[test]
+        fn write_read_cycle_across_sessions() {
+            let dir = tempdir().expect("tmp dir");
+            let path = dir.path().join("test_mmap");
+
+            // new_file + mmap + write + sync
+            unsafe {
+                let file = OsFile::new(&path, PAGE).expect("new file");
+                file.zero_extend(PAGE).expect("set init len");
+                file.sync().expect("flush to disk");
+
+                let map = unsafe { MMap::map(file.fd(), PAGE).expect("new map") };
+                let ptr = map.get_mut::<u64>(0);
+
+                *ptr = 0xDEAD_C0DE_DEAD_C0DE;
+                map.sync().expect("sync failed");
+
+                unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+
+            // open_file + mmap + read
+            unsafe {
+                let file = OsFile::open(&path, PAGE).expect("new file");
+                let map = unsafe { MMap::map(file.fd(), PAGE).expect("new map") };
+
+                let val = *map.get::<u64>(0);
+                assert_eq!(val, 0xDEAD_C0DE_DEAD_C0DE);
+
+                unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
+                assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
+
+        #[test]
+        fn mmap_read_and_pread_reads_same_data() {
+            let file = tmp_file(8);
+            let map = unsafe { MMap::map(file.fd(), PAGE).expect("new map") };
+
+            // write + sync
+            unsafe {
+                let ptr = map.get_mut::<u64>(0);
+                *ptr = 0xDEAD_C0DE_DEAD_C0DE;
+                map.sync().expect("sync failed");
+            }
+
+            // pread
+            unsafe {
+                let mut buf = [0u8; 8];
+                file.read(buf.as_mut_ptr(), 0, 1);
+                assert_eq!(u64::from_le_bytes(buf), 0xDEAD_C0DE_DEAD_C0DE);
+            }
+
+            unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
+            assert!(file.close().is_ok(), "failed to close the file");
+        }
+    }
+}
