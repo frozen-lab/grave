@@ -134,3 +134,183 @@ impl<'a, T> MemMapWriter<'a, T> {
         unsafe { f(&mut *self.ptr) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::tempdir;
+
+    const PAGE_SIZE: usize = 0x20;
+
+    fn tmp_file(len: usize) -> OsFile {
+        let dir = tempdir().expect("tmp dir");
+        let path = dir.path().join("tmp_memmap");
+
+        let file = OsFile::new(&path, PAGE_SIZE).expect("new file");
+        file.zero_extend(len).expect("zero extend");
+        file.sync().expect("sync");
+        file
+    }
+
+    #[test]
+    fn map_unmap_cycle() {
+        let file = tmp_file(PAGE_SIZE);
+
+        let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+        assert_eq!(mmap.len(), PAGE_SIZE);
+
+        assert!(mmap.unmap().is_ok(), "unmap failed");
+        assert!(file.close().is_ok(), "close failed");
+    }
+
+    #[test]
+    fn sync_sanity() {
+        let file = tmp_file(PAGE_SIZE);
+        let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+
+        assert!(mmap.sync().is_ok(), "sync failed");
+
+        assert!(mmap.unmap().is_ok());
+        assert!(file.close().is_ok());
+    }
+
+    mod write_read {
+        use super::*;
+
+        #[test]
+        fn write_read_cycle() {
+            let file = tmp_file(PAGE_SIZE);
+            let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+
+            {
+                let w = mmap.writer::<u64>(0);
+                w.write(|v| *v = 0xDEAD_C0DE_DEAD_C0DE);
+                mmap.sync().expect("sync");
+            }
+
+            {
+                let r = mmap.reader::<u64>(0);
+                assert_eq!(*r.read(), 0xDEAD_C0DE_DEAD_C0DE);
+            }
+
+            assert!(mmap.unmap().is_ok());
+            assert!(file.close().is_ok());
+        }
+
+        #[test]
+        fn write_read_cycle_across_sessions() {
+            let dir = tempdir().expect("tmp dir");
+            let path = dir.path().join("persist");
+
+            // create_file + mmap + write + sync
+            {
+                let file = OsFile::new(&path, PAGE_SIZE).expect("new");
+                file.zero_extend(PAGE_SIZE).unwrap();
+                file.sync().expect("failed to sync");
+
+                let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+                mmap.writer::<u64>(0).write(|v| *v = 0xAABBCCDDEEFF0011);
+                mmap.sync().expect("failed to sync");
+
+                assert!(mmap.unmap().is_ok());
+                assert!(file.close().is_ok());
+            }
+
+            // open_file + mmap + read
+            {
+                let file = OsFile::open(&path, PAGE_SIZE).expect("open");
+                let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+
+                let r = mmap.reader::<u64>(0);
+                assert_eq!(*r.read(), 0xAABBCCDDEEFF0011);
+
+                assert!(mmap.unmap().is_ok());
+                assert!(file.close().is_ok());
+            }
+        }
+
+        #[test]
+        fn mmap_and_pread_see_same_data() {
+            let file = tmp_file(PAGE_SIZE);
+            let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+
+            // write
+            {
+                mmap.writer::<u64>(0).write(|v| *v = 0xDEAD_C0DE_DEAD_C0DE);
+                mmap.sync().expect("failed to sync");
+            }
+
+            // read
+            {
+                let mut buf = [0u8; 8];
+                file.read(buf.as_mut_ptr(), 0, 1).expect("failed to read");
+                assert_eq!(u64::from_le_bytes(buf), 0xDEAD_C0DE_DEAD_C0DE);
+            }
+
+            assert!(mmap.unmap().is_ok());
+            assert!(file.close().is_ok());
+        }
+    }
+
+    mod concurrent_write_read {
+        use super::*;
+
+        #[test]
+        fn write_read_cycle() {
+            let file = tmp_file(PAGE_SIZE);
+            let mmap = Arc::new(MemMap::map(&file, PAGE_SIZE).expect("map"));
+
+            mmap.writer::<u64>(0).write(|v| *v = 0x1122334455667788);
+            mmap.sync().expect("failed to sync");
+
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let mmap = Arc::clone(&mmap);
+                handles.push(thread::spawn(move || {
+                    let r = mmap.reader::<u64>(0);
+                    assert_eq!(*r.read(), 0x1122334455667788);
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+
+            assert!(mmap.unmap().is_ok());
+            assert!(file.close().is_ok());
+        }
+
+        #[test]
+        fn concurrent_writes_to_disjoint_offsets() {
+            const N: usize = 4;
+
+            let file = tmp_file(PAGE_SIZE * N);
+            let mmap = Arc::new(MemMap::map(&file, PAGE_SIZE * N).expect("map"));
+
+            let mut handles = Vec::new();
+            for i in 0..N {
+                let mmap = Arc::clone(&mmap);
+                handles.push(thread::spawn(move || {
+                    let off = i * PAGE_SIZE;
+                    mmap.writer::<u64>(off).write(|v| *v = i as u64);
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+
+            mmap.sync().expect("failed to sync");
+
+            for i in 0..N {
+                let r = mmap.reader::<u64>(i * PAGE_SIZE);
+                assert_eq!(*r.read(), i as u64);
+            }
+
+            assert!(mmap.unmap().is_ok());
+            assert!(file.close().is_ok());
+        }
+    }
+}

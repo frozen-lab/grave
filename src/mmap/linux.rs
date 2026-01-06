@@ -129,7 +129,7 @@ mod tests {
         let path = dir.path().join(&format!("test_mmap_{len}"));
 
         unsafe {
-            let file = OsFile::new(&path, PAGE).expect("new file");
+            let file = OsFile::new(&path, len).expect("new file");
             file.zero_extend(len).expect("set init len");
             file.sync().expect("flush to disk");
             file
@@ -269,7 +269,7 @@ mod tests {
             // pread
             unsafe {
                 let mut buf = [0u8; 8];
-                file.read(buf.as_mut_ptr(), 0, 1);
+                file.read(buf.as_mut_ptr(), 0, 1).expect("failed to read");
                 assert_eq!(u64::from_le_bytes(buf), 0xDEAD_C0DE_DEAD_C0DE);
             }
 
