@@ -66,7 +66,7 @@ impl MMap {
 
     /// Get an immutable reference of [`T`] from [`MMap`]
     #[inline]
-    pub(crate) unsafe fn get<T>(&self, off: usize) -> *const T {
+    pub(crate) const unsafe fn get<T>(&self, off: usize) -> *const T {
         #[cfg(debug_assertions)]
         {
             let size = std::mem::size_of::<T>();
@@ -81,7 +81,7 @@ impl MMap {
 
     /// Get a mutable reference of [`T`] from [`MMap`]
     #[inline]
-    pub(crate) unsafe fn get_mut<T>(&self, off: usize) -> *mut T {
+    pub(crate) const unsafe fn get_mut<T>(&self, off: usize) -> *mut T {
         #[cfg(debug_assertions)]
         {
             let size = std::mem::size_of::<T>();

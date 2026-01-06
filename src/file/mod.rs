@@ -3,7 +3,8 @@ use crate::GraveResult;
 #[cfg(target_os = "linux")]
 mod linux;
 
-pub(crate) struct GraveFile {
+#[derive(Debug)]
+pub(crate) struct OsFile {
     page_size: usize,
 
     #[cfg(target_os = "linux")]
@@ -13,20 +14,20 @@ pub(crate) struct GraveFile {
     file: (),
 }
 
-unsafe impl Send for GraveFile {}
-unsafe impl Sync for GraveFile {}
+unsafe impl Send for OsFile {}
+unsafe impl Sync for OsFile {}
 
-impl std::fmt::Display for GraveFile {
+impl std::fmt::Display for OsFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        write!(f, "GraveFile {{fd: {:?}}}", self.file.fd())
+        write!(f, "OsFile {{fd: {:?}}}", self.file.fd())
     }
 }
 
-impl GraveFile {
+impl OsFile {
     pub(crate) fn new(path: &std::path::PathBuf, page_size: usize) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let file = ();
@@ -138,7 +139,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("tmp_file");
 
-        let file = GraveFile::new(&path, PAGE_SIZE).expect("create new file");
+        let file = OsFile::new(&path, PAGE_SIZE).expect("create new file");
         assert_eq!(file.len().expect("read file len"), 0);
 
         assert!(file.close().is_ok(), "failed to close file");
@@ -151,11 +152,11 @@ mod tests {
         let path = dir.path().join("tmp_file");
 
         {
-            let file = GraveFile::new(&path, PAGE_SIZE).expect("create new file");
+            let file = OsFile::new(&path, PAGE_SIZE).expect("create new file");
             assert!(file.close().is_ok(), "failed to close file");
         }
 
-        let file = GraveFile::open(&path, PAGE_SIZE).expect("open existing file");
+        let file = OsFile::open(&path, PAGE_SIZE).expect("open existing file");
         assert_eq!(file.len().expect("read file len"), 0);
 
         assert!(file.close().is_ok(), "failed to close file");
@@ -167,7 +168,7 @@ mod tests {
         let path = dir.path().join("missing_file");
 
         assert!(
-            GraveFile::open(&path, PAGE_SIZE).is_err(),
+            OsFile::open(&path, PAGE_SIZE).is_err(),
             "open must fail for missing file"
         );
     }
@@ -177,7 +178,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("tmp_file");
 
-        let file = GraveFile::new(&path, PAGE_SIZE).expect("create new file");
+        let file = OsFile::new(&path, PAGE_SIZE).expect("create new file");
         assert!(file.zero_extend(PAGE_SIZE * 2).is_ok(), "zero_extend failed");
         assert!(file.sync().is_ok(), "fdatasync failed");
 
@@ -193,7 +194,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("tmp_file");
 
-        let file = GraveFile::new(&path, PAGE_SIZE).expect("create new file");
+        let file = OsFile::new(&path, PAGE_SIZE).expect("create new file");
         assert!(file.close().is_ok(), "failed to close file");
         assert!(file.close().is_err(), "close must fail after close");
     }
@@ -210,7 +211,7 @@ mod tests {
             let tmp = dir.path().join("tmp_file");
 
             unsafe {
-                let file = GraveFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::new(&tmp, PAGE_SIZE).expect("open existing file");
 
                 // write
                 assert!(file.write(DATA.as_ptr(), 0).is_ok(), "pwrite failed");
@@ -239,7 +240,7 @@ mod tests {
 
             // create + write + sync + close
             unsafe {
-                let file = GraveFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::new(&tmp, PAGE_SIZE).expect("open existing file");
 
                 assert!(file.write(DATA.as_ptr(), 0).is_ok(), "pwrite failed");
                 assert!(file.sync().is_ok(), "fdatasync failed");
@@ -249,7 +250,7 @@ mod tests {
 
             // open + read + close
             unsafe {
-                let file = GraveFile::open(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::open(&tmp, PAGE_SIZE).expect("open existing file");
 
                 // len validation
                 let len = file.len().expect("read len for file");
@@ -280,7 +281,7 @@ mod tests {
             let total_len = ptrs.len() * PAGE_SIZE;
 
             unsafe {
-                let file = GraveFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::new(&tmp, PAGE_SIZE).expect("open existing file");
 
                 // write
                 assert!(file.writev(&ptrs, 0).is_ok(), "pwritev failed");
@@ -315,7 +316,7 @@ mod tests {
 
             // create + write + sync + close
             unsafe {
-                let file = GraveFile::new(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::new(&tmp, PAGE_SIZE).expect("open existing file");
 
                 assert!(file.writev(&ptrs, 0).is_ok(), "pwritev failed");
                 assert!(file.sync().is_ok(), "fdatasync failed");
@@ -325,7 +326,7 @@ mod tests {
 
             // open + read + close
             unsafe {
-                let file = GraveFile::open(&tmp, PAGE_SIZE).expect("open existing file");
+                let file = OsFile::open(&tmp, PAGE_SIZE).expect("open existing file");
 
                 // len validation
                 let len = file.len().expect("read len for file");
@@ -357,7 +358,7 @@ mod tests {
 
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("tmp_file");
-            let file = Arc::new(GraveFile::new(&path, PAGE_SIZE).expect("create new file"));
+            let file = Arc::new(OsFile::new(&path, PAGE_SIZE).expect("create new file"));
 
             let mut handles = Vec::with_capacity(NTHREADS);
             for i in 0..NTHREADS {
@@ -398,7 +399,7 @@ mod tests {
 
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("tmp_file");
-            let file = Arc::new(GraveFile::new(&path, PAGE_SIZE).expect("create new file"));
+            let file = Arc::new(OsFile::new(&path, PAGE_SIZE).expect("create new file"));
 
             let data = vec![0xABu8; PAGE_SIZE];
             assert!(file.write(data.as_ptr(), 0).is_ok(), "initial write failed");
@@ -428,7 +429,7 @@ mod tests {
 
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("tmp_file");
-            let file = Arc::new(GraveFile::new(&path, PAGE_SIZE).expect("create new file"));
+            let file = Arc::new(OsFile::new(&path, PAGE_SIZE).expect("create new file"));
 
             let pages: Vec<Vec<u8>> = (0..NPAGES).map(|i| vec![i as u8; PAGE_SIZE]).collect();
             let ptrs: Vec<*const u8> = pages.iter().map(|p| p.as_ptr()).collect();
