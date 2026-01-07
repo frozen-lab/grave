@@ -7,13 +7,15 @@ pub enum GraveError {
     /// Represents an underlying I/O error (file system, OS, etc.)
     IO(String),
 
-    /// Lock poisoned
-    ///
-    /// NOTE: This can be because another thread panicked while holding it.
+    /// Represents a multithreading error, where a thread fails while a lock is held
     LockPoisoned(String),
 
     /// A fallback for unexpected or uncategorized errors.
     Miscellaneous(String),
+
+    /// Represents invalid internal state for [`Grave`], which is caused when internal
+    /// data is un-aligned, missing, is tampered or corrupted.
+    InvalidState(String),
 }
 
 impl From<std::io::Error> for GraveError {
@@ -31,9 +33,10 @@ impl<T> From<std::sync::PoisonError<T>> for GraveError {
 impl std::fmt::Display for GraveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IO(err) => write!(f, "GraveError {{err: {err}}}"),
-            Self::LockPoisoned(err) => write!(f, "GraveError {{err: {err}}}"),
-            Self::Miscellaneous(err) => write!(f, "GraveError {{err: {err}}}"),
+            Self::IO(err) => write!(f, "GraveError (IO) {{err: {err}}}"),
+            Self::InvalidState(err) => write!(f, "GraveError (InvalidState) {{err: {err}}}"),
+            Self::LockPoisoned(err) => write!(f, "GraveError (LockPoisoned) {{err: {err}}}"),
+            Self::Miscellaneous(err) => write!(f, "GraveError (Miscellaneous) {{err: {err}}}"),
         }
     }
 }
