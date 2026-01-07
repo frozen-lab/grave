@@ -1,12 +1,10 @@
-// #![deny(missing_docs)]
+#![deny(missing_docs)]
 #![deny(unused_must_use)]
 #![allow(unsafe_op_in_unsafe_fn)]
 #![doc = include_str!("../README.md")]
 
-mod errors;
-
-#[allow(unused)]
 mod cfg;
+mod errors;
 
 #[allow(unused)]
 mod pool;
@@ -46,6 +44,7 @@ unsafe impl Send for Grave {}
 unsafe impl Sync for Grave {}
 
 impl Grave {
+    /// Create new instance of [`Grave`]
     pub fn new<P: AsRef<std::path::PathBuf>>(dirpath: P, cfg: GraveConfig) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
@@ -92,6 +91,8 @@ impl Grave {
         if ret != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+
+        // TODO: create status + sanity flag for Index & RawData file
 
         Ok(())
     }
