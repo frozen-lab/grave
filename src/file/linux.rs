@@ -1,9 +1,9 @@
 use crate::errors::{GraveError, GraveResult};
 use libc::{
-    c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, pread, pwrite, pwritev, size_t, stat, EPERM,
-    O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
+    c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, pread, pwrite, pwritev, size_t, stat,
+    unlink, EPERM, O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
 };
-use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
 #[derive(Debug, Clone)]
 pub(super) struct File(i32);
@@ -13,13 +13,13 @@ unsafe impl Sync for File {}
 
 impl File {
     /// Creates a new [`File`] at given `Path`
-    pub(crate) unsafe fn new(path: &Path) -> GraveResult<Self> {
+    pub(super) unsafe fn new(path: &std::path::PathBuf) -> GraveResult<Self> {
         let fd = Self::open_with_flags(path, Self::prep_flags(true))?;
         Ok(Self(fd))
     }
 
     /// Opens an existing [`File`] at given `Path`
-    pub(crate) unsafe fn open(path: &Path) -> GraveResult<Self> {
+    pub(super) unsafe fn open(path: &std::path::PathBuf) -> GraveResult<Self> {
         let fd = Self::open_with_flags(path, Self::prep_flags(false))?;
         Ok(Self(fd))
     }
@@ -30,7 +30,7 @@ impl File {
     }
 
     /// Fetches current length of [`File`]
-    pub(crate) unsafe fn len(&self) -> GraveResult<usize> {
+    pub(super) unsafe fn len(&self) -> GraveResult<usize> {
         let st = self.stats()?;
         Ok(st.st_size as usize)
     }
@@ -46,7 +46,7 @@ impl File {
     ///
     /// This way we avoid non-essential metadata updates, such as access time (`atime`),
     /// modification time (`mtime`), and other inode bookkeeping information!
-    pub(crate) unsafe fn sync(&self) -> GraveResult<()> {
+    pub(super) unsafe fn sync(&self) -> GraveResult<()> {
         let res = fdatasync(self.fd() as c_int);
         if res != 0 {
             return Self::last_os_error();
@@ -65,12 +65,29 @@ impl File {
         Ok(())
     }
 
+    /// Unlinks (possibly deletes) [`File`] from filesystem
+    ///
+    /// **WARN**: Before using this, make sure [`File`] is closed, via [`File::close()`],
+    /// to avoid I/O errors
+    pub(super) unsafe fn unlink(&self, path: &std::path::PathBuf) -> GraveResult<()> {
+        // sanity check
+        debug_assert!(self.close().is_err(), "File must be closed before trying to unlink");
+
+        let cpath = File::path_to_cstring(path)?;
+        let res = unlink(cpath.as_ptr());
+        if res != 0 {
+            return Self::last_os_error();
+        }
+
+        Ok(())
+    }
+
     /// Truncates/extends length of [`File`]
     ///
     /// **WARN:** If `len` is smaller then the current length of [`File`] it'll be shrinked,
     /// which may result in data loss
     #[inline]
-    pub(crate) unsafe fn ftruncate(&self, len: usize) -> GraveResult<()> {
+    pub(super) unsafe fn ftruncate(&self, len: usize) -> GraveResult<()> {
         let res = ftruncate(self.fd(), len as off_t);
         if res != 0 {
             return Self::last_os_error();
@@ -81,7 +98,7 @@ impl File {
 
     /// Positional read from [`File`]
     #[inline(always)]
-    pub(crate) unsafe fn pread(&self, ptr: *mut u8, off: usize, len: usize) -> GraveResult<()> {
+    pub(super) unsafe fn pread(&self, ptr: *mut u8, off: usize, len: usize) -> GraveResult<()> {
         let mut read = 0usize;
         while read < len {
             let res = pread(
@@ -111,7 +128,7 @@ impl File {
 
     /// Positional write to [`File`]
     #[inline(always)]
-    pub(crate) unsafe fn pwrite(&self, ptr: *const u8, off: usize, page_size: usize) -> GraveResult<()> {
+    pub(super) unsafe fn pwrite(&self, ptr: *const u8, off: usize, page_size: usize) -> GraveResult<()> {
         // sanity checks
         debug_assert!(page_size > 0, "invalid page_size");
         debug_assert!(!ptr.is_null(), "ptr must never be null");
@@ -235,7 +252,7 @@ impl File {
     ///
     /// To remain sane across ownership models, containers, and shared filesystems,
     /// we explicitly retry the `open()` w/o `O_NOATIME` when `EPERM` is encountered
-    unsafe fn open_with_flags(path: &Path, flags: i32) -> GraveResult<i32> {
+    unsafe fn open_with_flags(path: &std::path::PathBuf, flags: i32) -> GraveResult<i32> {
         let cpath = File::path_to_cstring(path)?;
 
         let fd = if flags & O_CREAT != 0 {
@@ -287,7 +304,7 @@ impl File {
         BASE | ((is_new as i32) * NEW)
     }
 
-    fn path_to_cstring(path: &Path) -> GraveResult<CString> {
+    fn path_to_cstring(path: &std::path::PathBuf) -> GraveResult<CString> {
         CString::new(path.as_os_str().as_bytes()).map_err(|e| GraveError::IO(format!("Error due to invalid Path: {e}")))
     }
 
@@ -401,6 +418,55 @@ mod tests {
             let file = File::new(&tmp).expect("open existing file");
             assert!(file.close().is_ok(), "failed to close the file");
             assert!(file.close().is_err(), "should fail after file is closed");
+        }
+    }
+
+    #[test]
+    fn unlink_correctly_deletes_file() {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        unsafe {
+            let file = File::new(&tmp).expect("open existing file");
+
+            // close + unlink
+            assert!(file.close().is_ok(), "failed to close the file");
+            assert!(file.unlink(&tmp).is_ok(), "failed to unlink the file");
+
+            // sanity check
+            assert!(!tmp.exists(), "failed to delete file");
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    #[cfg(debug_assertions)]
+    fn unlink_fails_on_open_file() {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        unsafe {
+            let file = File::new(&tmp).expect("open existing file");
+
+            // NOTE: On Linux, `unlink` does not return an error, even when file has an
+            // open handle. So we protect this path by a debug assertion, to avoid messing
+            // a failure path, and catch this mishap via tests
+
+            // unlink (w/o closing), must panic as file is not closed
+            file.unlink(&tmp);
+        }
+    }
+
+    #[test]
+    fn unlink_fails_for_missing_file() {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        // dummy file w/ a dummy file fd
+        let dummy_file = File(0x200);
+
+        unsafe {
+            assert!(dummy_file.unlink(&tmp).is_err(), "should fail when file is missing");
         }
     }
 

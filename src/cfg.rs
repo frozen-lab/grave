@@ -293,11 +293,3 @@ impl GraveConfigValue {
         }
     }
 }
-
-#[derive(Debug, PartialEq, Clone)]
-pub(crate) struct InternalConfig {
-    pub(crate) memory_pool_size: usize,
-    pub(crate) dirpath: std::path::PathBuf,
-    pub(crate) page_size: GraveConfigValue,
-    pub(crate) initial_capacity: GraveConfigValue,
-}

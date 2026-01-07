@@ -61,6 +61,16 @@ impl OsFile {
         }
     }
 
+    pub(crate) fn delete(&self, path: &std::path::PathBuf) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.file.unlink(path)
+        }
+    }
+
     pub(crate) fn sync(&self) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
@@ -192,6 +202,23 @@ mod tests {
         let file = OsFile::new(&path).expect("create new file");
         assert!(file.close().is_ok(), "failed to close file");
         assert!(file.close().is_err(), "close must fail after close");
+    }
+
+    #[test]
+    fn delete_correctly_yanks_file() {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+
+        unsafe {
+            let file = OsFile::new(&tmp).expect("open existing file");
+
+            // close + unlink
+            assert!(file.close().is_ok(), "failed to close the file");
+            assert!(file.delete(&tmp).is_ok(), "failed to unlink the file");
+
+            // sanity check
+            assert!(!tmp.exists(), "failed to delete file");
+        }
     }
 
     mod write_read {
