@@ -1,9 +1,9 @@
+const DEFAULT_NUM_BLOCK: usize = 1;
 const DEFAULT_PAGE_SIZE: GraveConfigValue = GraveConfigValue::N64;
-const DEFAULT_INIT_CAP: GraveConfigValue = GraveConfigValue::N256;
 const DEFAULT_MEM_POOL_CAP: GraveConfigValue = GraveConfigValue::N64;
 
 // sanity check
-const _: () = assert!(DEFAULT_INIT_CAP.to_u32() >= 0x100, "INIT_CAP must be >= 256");
+const _: () = assert!(DEFAULT_NUM_BLOCK > 0, "NUM_BLOCK must be > 0");
 const _: () = assert!(DEFAULT_PAGE_SIZE.to_u32() >= 8, "PAGE_SIZE must be >= 8 bytes");
 const _: () = assert!(DEFAULT_MEM_POOL_CAP.to_u32() >= 8, "MEM_POOL_CAP must be >= 8 slots");
 
@@ -16,7 +16,7 @@ const _: () = assert!(DEFAULT_MEM_POOL_CAP.to_u32() >= 8, "MEM_POOL_CAP must be 
 /// ```md
 ///  | Field                  | Value      |
 ///  |----------------------- |------------|
-///  | memory_pool_capacity   | 64 units   |
+///  | num_block              | 01 block   |
 ///  | page_size              | 32 bytes   |
 ///  | initial_capacity       | 256 units  |
 /// ```
@@ -32,8 +32,8 @@ const _: () = assert!(DEFAULT_MEM_POOL_CAP.to_u32() >= 8, "MEM_POOL_CAP must be 
 /// use grave::{GraveConfig, GraveConfigValue};
 ///
 /// let cfg = GraveConfig {
+///   num_block: 4usize,
 ///   page_size: GraveConfigValue::N128,
-///   initial_capacity: GraveConfigValue::N4096,
 ///   memory_pool_capacity: GraveConfigValue::N128,
 /// };
 /// ```
@@ -136,35 +136,36 @@ pub struct GraveConfig {
     /// ```
     pub page_size: GraveConfigValue,
 
-    /// Controls the **initial number of on-disk pages** allocated for [`Grave`].
+    /// Controls the **initial number of blocks** created for [`Grave`] before any growth is triggered.
     ///
-    /// Each unit represents _one on-disk page_. The size of each page is defined
-    /// by [`page_size`].
+    /// Each block contains **4048 on-disk pages**, and creates **512 bytes** of memory overhead per block.
     ///
-    /// ## Working
+    /// ## Working of Block
     ///
-    /// - On initialization, [`Grave`] pre-allocates N pages on disk
-    /// - Write operations consume these pages as data is written
-    /// - When all pages are exhausted, [`Grave`] grows the on-disk storage, haulting upcoming
-    ///   write operations for a short while
+    /// - On init, [`Grave`] pre-allocates N pages on disk, **4048 entries** per block
+    /// - Write operations consume these pages as data is written on disk
+    /// - When all pages are exhausted, [`Grave`] haults all write/read operations for a short while,
+    ///   to grow the on-disk storage
     ///
-    /// ## Growth & Write Latency
+    /// ## Growth & Write/Read Latency
     ///
-    /// If the on-disk pages are exhausted, storage growth is triggered, which triggers file expansion,
-    /// which temporarily increase overall write latency.
+    /// If the on-disk pages are exhausted, storage growth is triggered, which calls for file expansion.
     ///
-    /// To avoid growth, where higher write frequency is expected, configure `initial_capacity` w/ a
-    /// large enough value to avoid growth trigger.
+    /// The growth process temporarily increase overall write/read latency.
     ///
-    /// ## Disk Usage
+    /// To avoid growth, where higher write frequency is expected, configure `num_block` w/ a
+    /// large enough value, which would avoid frequent growth, decreasing operation latency.
     ///
-    /// This value defines the **minimum disk space** reserved by [`Grave`],
+    /// ## Block Overhead (On-Disk + Memory)
     ///
-    /// ```text
-    /// min_disk_usage = initial_capacity * page_size
+    /// For a given `num_block = 1` & `page_size = 64`,
+    ///
+    /// ```md
+    /// > memory_usage => 512 bytes # 0.5 KiB
+    /// > disk_usage => (64 * 4048) + 512 # 259584 bytes (253.5 KiB)
     /// ```
     ///
-    /// Disk usage grows beyond this only when required.
+    /// Both Memory + Disk usage _grows beyond this_ only when required.
     ///
     /// # Example
     ///
@@ -172,11 +173,11 @@ pub struct GraveConfig {
     /// use grave::{GraveConfig, GraveConfigValue};
     ///
     /// let cfg = GraveConfig {
-    ///   initial_capacity: GraveConfigValue::N4096,
+    ///   num_block: 4usize,
     ///   ..Default::default()
     /// };
     /// ```
-    pub initial_capacity: GraveConfigValue,
+    pub num_block: usize,
 }
 
 impl Default for GraveConfig {
@@ -187,15 +188,15 @@ impl Default for GraveConfig {
     /// ```md
     ///  | Field                  | Value      |
     ///  |----------------------- |------------|
+    ///  | num_block              | 01 block   |
     ///  | page_size              | 32 bytes   |
     ///  | memory_pool_capacity   | 64 units   |
-    ///  | initial_capacity       | 256 units  |
     /// ```
     ///
-    /// Which result in follow memory and disk usage,
+    /// Which results in follow memory and disk usage,
     ///
-    /// - **in-memory: 64 * 32 = 2048 bytes (2 KiB)**
-    /// - **on-disk: 256 * 32 = 8192 bytes (8 KiB)**
+    /// - **in-memory: (64 * 32) + 512 = 2560 bytes (2.5 KiB)**
+    /// - **on-disk: (256 * 32) + 512 = 8704 bytes (8.5 KiB)**
     ///
     /// # Example
     ///
@@ -206,16 +207,16 @@ impl Default for GraveConfig {
     /// ```
     fn default() -> Self {
         Self {
-            memory_pool_capacity: DEFAULT_MEM_POOL_CAP,
+            num_block: DEFAULT_NUM_BLOCK,
             page_size: DEFAULT_PAGE_SIZE,
-            initial_capacity: DEFAULT_INIT_CAP,
+            memory_pool_capacity: DEFAULT_MEM_POOL_CAP,
         }
     }
 }
 
 /// Discrete, power-of-two configuration values used for [`GraveConfig`].
 ///
-/// Each variant maps to a concrete numeric value (in bytes or in units).
+/// Each variant maps to a concrete numeric value (units/bytes).
 ///
 /// ## Why
 ///
@@ -230,47 +231,47 @@ impl Default for GraveConfig {
 /// use grave::{GraveConfig, GraveConfigValue};
 ///
 /// let cfg = GraveConfig {
+///   num_block: 4usize,
 ///   page_size: GraveConfigValue::N128,
-///   initial_capacity: GraveConfigValue::N4096,
 ///   memory_pool_capacity: GraveConfigValue::N128,
 /// };
 /// ```
 #[derive(Debug, PartialEq, Clone)]
 pub enum GraveConfigValue {
-    /// 8 units
+    /// 8 units/bytes
     N8,
 
-    /// 0x10 units
+    /// 0x10 units/bytes
     N16,
 
-    /// 0x20 units
+    /// 0x20 units/bytes
     N32,
 
-    /// 0x40 units
+    /// 0x40 units/bytes
     N64,
 
-    /// 0x80 units
+    /// 0x80 units/bytes
     N128,
 
-    /// 0x100 units
+    /// 0x100 units/bytes
     N256,
 
-    /// 0x200 units
+    /// 0x200 units/bytes
     N512,
 
-    /// 0x400 units
+    /// 0x400 units/bytes
     N1024,
 
-    /// 0x800 units
+    /// 0x800 units/bytes
     N2048,
 
-    /// 0x1000 units
+    /// 0x1000 units/bytes
     N4096,
 
-    /// 0x2000 units
+    /// 0x2000 units/bytes
     N8192,
 
-    /// 0x4000 units
+    /// 0x4000 units/bytes
     N16384,
 }
 
