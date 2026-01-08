@@ -2,7 +2,7 @@ use crate::errors::GraveResult;
 use libc::{c_void, mmap, msync, munmap, off_t, MAP_FAILED, MAP_SHARED, MS_ASYNC, MS_SYNC, PROT_READ, PROT_WRITE};
 
 #[derive(Debug)]
-pub(crate) struct MMap {
+pub(super) struct MMap {
     ptr: *mut c_void,
     len: usize,
 }
@@ -22,7 +22,7 @@ impl MMap {
     ///
     /// Explicit calls to `sync()` are required to establish durability boundaries
     /// and ensure that modified pages are written to stable storage
-    pub(crate) unsafe fn map(fd: i32, len: usize) -> GraveResult<Self> {
+    pub(super) unsafe fn map(fd: i32, len: usize) -> GraveResult<Self> {
         let ptr = mmap(
             std::ptr::null_mut(),
             len,
@@ -40,7 +40,7 @@ impl MMap {
     }
 
     /// Unmap the [`MMap`] region
-    pub(crate) unsafe fn unmap(&self) -> GraveResult<()> {
+    pub(super) unsafe fn unmap(&self) -> GraveResult<()> {
         if munmap(self.ptr, self.len) != 0 {
             return Self::last_os_error();
         }
@@ -49,7 +49,7 @@ impl MMap {
 
     /// Asynchronously syncs dirty pages of [`MMap`] to disk
     #[allow(unused)]
-    pub(crate) unsafe fn async_sync(&self) -> GraveResult<()> {
+    pub(super) unsafe fn async_sync(&self) -> GraveResult<()> {
         if msync(self.ptr, self.len, MS_ASYNC) != 0 {
             return Self::last_os_error();
         }
@@ -57,7 +57,7 @@ impl MMap {
     }
 
     /// Syncs dirty pages of [`MMap`] to disk
-    pub(crate) unsafe fn sync(&self) -> GraveResult<()> {
+    pub(super) unsafe fn sync(&self) -> GraveResult<()> {
         if msync(self.ptr, self.len, MS_SYNC) != 0 {
             return Self::last_os_error();
         }
@@ -66,7 +66,7 @@ impl MMap {
 
     /// Get an immutable reference of [`T`] from [`MMap`]
     #[inline]
-    pub(crate) const unsafe fn get<T>(&self, off: usize) -> *const T {
+    pub(super) const unsafe fn get<T>(&self, off: usize) -> *const T {
         #[cfg(debug_assertions)]
         {
             let size = std::mem::size_of::<T>();
@@ -81,7 +81,7 @@ impl MMap {
 
     /// Get a mutable reference of [`T`] from [`MMap`]
     #[inline]
-    pub(crate) const unsafe fn get_mut<T>(&self, off: usize) -> *mut T {
+    pub(super) const unsafe fn get_mut<T>(&self, off: usize) -> *mut T {
         #[cfg(debug_assertions)]
         {
             let size = std::mem::size_of::<T>();
@@ -96,7 +96,7 @@ impl MMap {
 
     /// Fetches current length of [`MMap`]
     #[inline]
-    pub(crate) const fn len(&self) -> usize {
+    pub(super) const fn len(&self) -> usize {
         self.len
     }
 

@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 use crate::{errors::GraveResult, file::OsFile};
 
 #[cfg(target_os = "linux")]
@@ -69,6 +67,28 @@ impl MemMap {
     }
 
     #[inline]
+    pub(crate) const fn get<T>(&self, off: usize) -> *const T {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.mmap.get(off)
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn get_mut<T>(&self, off: usize) -> *mut T {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.mmap.get_mut(off)
+        }
+    }
+
+    #[inline]
     pub(crate) const fn reader<'a, T>(&'a self, off: usize) -> MemMapReader<'a, T> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
@@ -98,13 +118,16 @@ impl MemMap {
 #[derive(Debug)]
 pub(crate) struct MemMapReader<'a, T> {
     ptr: *const T,
-    _pd: PhantomData<&'a T>,
+    _pd: std::marker::PhantomData<&'a T>,
 }
 
 impl<'a, T> MemMapReader<'a, T> {
     #[inline]
     const fn new(ptr: *const T) -> Self {
-        Self { ptr, _pd: PhantomData }
+        Self {
+            ptr,
+            _pd: std::marker::PhantomData,
+        }
     }
 
     #[inline]
@@ -120,13 +143,16 @@ impl<'a, T> MemMapReader<'a, T> {
 #[derive(Debug)]
 pub(crate) struct MemMapWriter<'a, T> {
     ptr: *mut T,
-    _pd: PhantomData<&'a T>,
+    _pd: std::marker::PhantomData<&'a T>,
 }
 
 impl<'a, T> MemMapWriter<'a, T> {
     #[inline]
     const fn new(ptr: *mut T) -> Self {
-        Self { ptr, _pd: PhantomData }
+        Self {
+            ptr,
+            _pd: std::marker::PhantomData,
+        }
     }
 
     #[inline]

@@ -1,4 +1,8 @@
-use crate::{file::OsFile, mmap::MemMap, GraveConfig, GraveError, GraveResult};
+use crate::{
+    file::OsFile,
+    mmap::{MemMap, MemMapReader},
+    GraveConfig, GraveError, GraveResult,
+};
 
 const VERSION: u32 = 0;
 const MAGIC: [u8; 4] = *b"indx";
@@ -24,6 +28,7 @@ const _: () = assert!(MIN_BLOCKS_ON_INIT >= 2, "Must be space for BitMap and Adj
 pub(crate) struct Index {
     file: OsFile,
     mmap: MemMap,
+    ptrs: IndexPtrs,
 }
 
 impl Index {
@@ -87,7 +92,11 @@ impl Index {
             writer.write(|h| *h = BlockHeader::new(BlockHeaderFlag::BITMAP, next));
         }
 
-        Ok(Self { file, mmap })
+        Ok(Self {
+            ptrs: IndexPtrs::new(&mmap),
+            file,
+            mmap,
+        })
     }
 
     pub(crate) fn open(dirpath: &std::path::PathBuf) -> GraveResult<Self> {
@@ -123,7 +132,7 @@ impl Index {
         })?;
 
         // S4: Read & Validate Metadata
-        let meta_reader = mmap.reader::<Metadata>(0);
+        let meta_reader = mmap.reader::<Metadata>(METADATA_OFF);
         let metadata = meta_reader.read();
         if metadata.version != VERSION || metadata.magic != MAGIC {
             // same as above
@@ -131,7 +140,19 @@ impl Index {
             return Err(GraveError::InvalidState("Invalid metadata for Index file".into()));
         }
 
-        Ok(Self { file, mmap })
+        Ok(Self {
+            ptrs: IndexPtrs::new(&mmap),
+            file,
+            mmap,
+        })
+    }
+
+    pub(crate) const fn current_capacity(&self) -> usize {
+        unsafe { (*self.ptrs.meta).current_cap as usize }
+    }
+
+    pub(crate) const fn total_entries(&self) -> usize {
+        unsafe { (*self.ptrs.meta).total_entries as usize }
     }
 
     /// Closes and Deletes the [`OsFile`]
@@ -151,6 +172,27 @@ impl Index {
     fn clear_file(file: &OsFile, filepath: &std::path::PathBuf) {
         if file.close().is_ok() {
             file.delete(filepath);
+        }
+    }
+}
+
+//
+// Index Pointers
+//
+
+#[derive(Debug)]
+struct IndexPtrs {
+    meta: *mut Metadata,
+    bitmap: *mut BitMap,
+    adjarr: *mut AdjArr,
+}
+
+impl IndexPtrs {
+    fn new(mmap: &MemMap) -> Self {
+        Self {
+            meta: mmap.get_mut::<Metadata>(METADATA_OFF),
+            bitmap: mmap.get_mut::<BitMap>(METADATA_SIZE + (DEFAULT_BITMAP_IDX * BLOCK_SIZE)),
+            adjarr: mmap.get_mut::<AdjArr>(METADATA_SIZE + (DEFAULT_ADJARR_IDX * BLOCK_SIZE)),
         }
     }
 }
