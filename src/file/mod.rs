@@ -101,17 +101,25 @@ impl OsFile {
         }
     }
 
-    pub(crate) fn lock(&self) -> GraveResult<()> {
+    /// Gives an excluive (cross-process) access to the [`OsFile`]
+    ///
+    /// ## RAII Safe
+    ///
+    /// The file lock is tied to [`OsFileLockGuard`], when it's dropped,
+    /// the resource is automatically be freed
+    #[inline]
+    pub(crate) fn lock(&self) -> GraveResult<OsFileLockGuard<'_>> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.lock()
+            self.file.lock()?;
+            Ok(OsFileLockGuard(self))
         }
     }
 
-    pub(crate) fn unlock(&self) -> GraveResult<()> {
+    fn unlock(&self) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
@@ -152,6 +160,19 @@ impl OsFile {
         unsafe {
             self.file.pwritev(ptr, off, page_size)
         }
+    }
+}
+
+//
+// RAII guard for Locks
+//
+
+pub(crate) struct OsFileLockGuard<'a>(&'a OsFile);
+
+impl<'a> Drop for OsFileLockGuard<'a> {
+    fn drop(&mut self) {
+        // NOTE: We silently consume the error, as we can't panic in Drop ^_~
+        let _ = self.0.unlock();
     }
 }
 

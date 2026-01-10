@@ -1,3 +1,5 @@
+use std::{cell::UnsafeCell, sync::RwLock};
+
 use crate::{
     file::OsFile,
     mmap::{MemMap, MemMapReader},
@@ -27,8 +29,9 @@ const _: () = assert!(MIN_BLOCKS_ON_INIT >= 2, "Must be space for BitMap and Adj
 #[derive(Debug)]
 pub(crate) struct Index {
     file: OsFile,
-    mmap: MemMap,
-    ptrs: IndexPtrs,
+    lock: RwLock<()>,
+    mmap: UnsafeCell<MemMap>,
+    ptrs: UnsafeCell<IndexPtrs>,
 }
 
 impl Index {
@@ -74,7 +77,7 @@ impl Index {
             }
 
             // first adjarr
-            if block_idx == DEFAULT_BITMAP_IDX {
+            if block_idx == DEFAULT_ADJARR_IDX {
                 writer.write(|h| {
                     *h = BlockHeader::new(
                         BlockHeaderFlag::ADJARR,
@@ -93,9 +96,10 @@ impl Index {
         }
 
         Ok(Self {
-            ptrs: IndexPtrs::new(&mmap),
+            ptrs: UnsafeCell::new(IndexPtrs::new(&mmap)),
+            mmap: UnsafeCell::new(mmap),
+            lock: RwLock::new(()),
             file,
-            mmap,
         })
     }
 
@@ -141,35 +145,68 @@ impl Index {
         }
 
         Ok(Self {
-            ptrs: IndexPtrs::new(&mmap),
+            ptrs: UnsafeCell::new(IndexPtrs::new(&mmap)),
+            mmap: UnsafeCell::new(mmap),
+            lock: RwLock::new(()),
             file,
-            mmap,
         })
     }
 
-    pub(crate) const fn current_capacity(&self) -> usize {
-        unsafe { (*self.ptrs.meta).current_cap as usize }
-    }
+    fn grow(&self, kind: GrowKind) -> GraveResult<u32> {
+        // S0: Get an exclusive (cross-process) access to [`Index`]
+        //
+        // NOTE: Both lock guards are RAII, and are unlocked when the values are dropped
+        let _write_guard = self.lock.write()?; // process-wide exclusion
+        let _file_guard = self.file.lock()?; // cross-process exclusion
+        let mmap = unsafe { &mut *self.mmap.get() };
 
-    pub(crate) const fn total_entries(&self) -> usize {
-        unsafe { (*self.ptrs.meta).total_entries as usize }
-    }
+        // S1: calc new len (extended) for file
+        let old_len = self.file.len()?;
+        let old_blocks = (old_len - METADATA_SIZE) / BLOCK_SIZE;
+        let new_block_idx = old_blocks as u32;
+        let new_len = old_len + BLOCK_SIZE;
 
-    fn grow(&self) -> GraveResult<()> {
-        // unmap the current mmap, then grow file and then re-map again
+        // S2: unmap, zero_extend & remap
+        mmap.unmap()?;
+        self.file.zero_extend(new_len)?;
+        *mmap = MemMap::map(&self.file, new_len)?;
 
-        // 2x of the current size of blocks, e.g. 2 => 4 blocks, etc.
-        let new_file_len = {
-            let curr = self.file.len()?;
-            curr + (curr - METADATA_SIZE)
+        // S3: update current & new tail
+        let meta = mmap.get_mut::<Metadata>(METADATA_OFF);
+        let (tail_idx, flag) = match kind {
+            GrowKind::BitMap => (unsafe { (*meta).bmap_tail_idx }, BlockHeaderFlag::BITMAP),
+            GrowKind::AdjArr => (unsafe { (*meta).aarr_tail_idx }, BlockHeaderFlag::ADJARR),
         };
+        let old_tail_off = METADATA_SIZE + tail_idx as usize * BLOCK_SIZE;
+        let new_tail_off = METADATA_SIZE + new_block_idx as usize * BLOCK_SIZE;
 
-        self.file.zero_extend(new_file_len)?;
-        self.mmap.unmap()?;
+        mmap.writer::<BlockHeader>(old_tail_off)
+            .write(|header| header.set_nidx(new_block_idx));
+        mmap.writer::<BlockHeader>(new_tail_off)
+            .write(|h| *h = BlockHeader::new(flag, 0));
 
-        let new_map = MemMap::map(&self.file, new_file_len)?;
+        // S4: Update metadata & rebuild index pointers
+        unsafe {
+            // NOTE: Metadata must be updated before rebulding the index pointers
 
-        Ok(())
+            // meta update
+            match kind {
+                GrowKind::BitMap => (*meta).bmap_tail_idx = new_block_idx,
+                GrowKind::AdjArr => (*meta).aarr_tail_idx = new_block_idx,
+            }
+            (*meta).num_block += 1;
+            (*meta).current_cap += PAGES_PER_BLOCK as u64;
+
+            // rebuild idx ptrs
+            *self.ptrs.get() = IndexPtrs::new(mmap);
+        }
+
+        // S5: unlocking
+        //
+        // NOTE: the file locks are RAII, hence the underlying resource is released
+        // automatically when the value is dropped. So we just ball ^0^
+
+        Ok(new_block_idx)
     }
 
     /// Closes and Deletes the [`OsFile`]
@@ -194,22 +231,42 @@ impl Index {
 }
 
 //
+// Grow Kinds
+//
+
+#[derive(Debug, PartialEq)]
+enum GrowKind {
+    BitMap,
+    AdjArr,
+}
+
+//
 // Index Pointers
 //
 
 #[derive(Debug)]
 struct IndexPtrs {
     meta: *mut Metadata,
-    bitmap: *mut BitMap,
-    adjarr: *mut AdjArr,
+    bmap_tail: *mut BitMap,
+    aarr_tail: *mut AdjArr,
 }
 
 impl IndexPtrs {
+    /// Init [`IndexPtrs`] to hold cached pointers to block in [`MMap`]
+    ///
+    /// ## Safety Rule
+    ///
+    /// When [`Index::grow`] is triggered, the [`Metadata`] must always be
+    /// updated before trying to re-build the [`IndexPtrs`].
     fn new(mmap: &MemMap) -> Self {
+        let meta = mmap.get_mut::<Metadata>(METADATA_OFF);
+        let bmap_idx = unsafe { (*meta).bmap_tail_idx as usize };
+        let aarr_idx = unsafe { (*meta).aarr_tail_idx as usize };
+
         Self {
-            meta: mmap.get_mut::<Metadata>(METADATA_OFF),
-            bitmap: mmap.get_mut::<BitMap>(METADATA_SIZE + (DEFAULT_BITMAP_IDX * BLOCK_SIZE)),
-            adjarr: mmap.get_mut::<AdjArr>(METADATA_SIZE + (DEFAULT_ADJARR_IDX * BLOCK_SIZE)),
+            meta,
+            bmap_tail: mmap.get_mut::<BitMap>(METADATA_SIZE + bmap_idx * BLOCK_SIZE),
+            aarr_tail: mmap.get_mut::<AdjArr>(METADATA_SIZE + aarr_idx * BLOCK_SIZE),
         }
     }
 }
@@ -224,8 +281,8 @@ struct Metadata {
     magic: [u8; 4],
     page_size: u32,
     num_block: u32,
-    bitmap_idx: u32,
-    adjarr_idx: u32,
+    bmap_tail_idx: u32,
+    aarr_tail_idx: u32,
     current_cap: u64,
     total_entries: u64,
     _padd: [u8; 0x18],
@@ -246,8 +303,8 @@ impl Metadata {
             version: VERSION,
             total_entries: 0,
             page_size: cfg.page_size.to_u32(),
-            bitmap_idx: DEFAULT_BITMAP_IDX as u32,
-            adjarr_idx: DEFAULT_ADJARR_IDX as u32,
+            bmap_tail_idx: DEFAULT_BITMAP_IDX as u32,
+            aarr_tail_idx: DEFAULT_ADJARR_IDX as u32,
             current_cap: (cfg.num_block * PAGES_PER_BLOCK) as u64,
             _padd: [0u8; 0x18],
         }
