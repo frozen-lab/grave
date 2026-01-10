@@ -152,12 +152,31 @@ impl Index {
         })
     }
 
-    fn grow(&self, kind: GrowKind) -> GraveResult<u32> {
-        // S0: Get an exclusive (cross-process) access to [`Index`]
-        //
+    fn grow(&self, kind: GrowKind) -> GraveResult<()> {
+        // NOTE: ensures block has no space left to avoid TOCTOU situations
+        if !self.is_tail_block_full(kind)? {
+            return Ok(());
+        }
+
         // NOTE: Both lock guards are RAII, and are unlocked when the values are dropped
         let _write_guard = self.lock.write()?; // process-wide exclusion
         let _file_guard = self.file.lock()?; // cross-process exclusion
+
+        // re-check under exclusive access
+        //
+        // NOTE: stronger validations are theere to prevent allocating more then required resources
+        if !self.is_tail_block_full(kind)? {
+            return Ok(());
+        }
+
+        // NOTE: the file locks are RAII, hence the underlying resource is released
+        // automatically when the value is dropped. So, We just ball ^0^
+
+        self._grow_locked(kind)
+    }
+
+    fn _grow_locked(&self, kind: GrowKind) -> GraveResult<()> {
+        // S0: Get an exclusive (cross-process) access to [`Index`]
         let mmap = unsafe { &mut *self.mmap.get() };
 
         // S1: calc new len (extended) for file
@@ -165,6 +184,9 @@ impl Index {
         let old_blocks = (old_len - METADATA_SIZE) / BLOCK_SIZE;
         let new_block_idx = old_blocks as u32;
         let new_len = old_len + BLOCK_SIZE;
+
+        // sanity check
+        debug_assert!(new_block_idx <= MAX_PAGE_INDEX, "block index overflow");
 
         // S2: unmap, zero_extend & remap
         mmap.unmap()?;
@@ -201,12 +223,19 @@ impl Index {
             *self.ptrs.get() = IndexPtrs::new(mmap);
         }
 
-        // S5: unlocking
-        //
-        // NOTE: the file locks are RAII, hence the underlying resource is released
-        // automatically when the value is dropped. So we just ball ^0^
+        Ok(())
+    }
 
-        Ok(new_block_idx)
+    fn is_tail_block_full(&self, kind: GrowKind) -> GraveResult<bool> {
+        let _r = self.lock.read()?;
+        let ptrs = unsafe { &*self.ptrs.get() };
+
+        let header = match kind {
+            GrowKind::BitMap => unsafe { &(*ptrs.bmap_tail).header },
+            GrowKind::AdjArr => unsafe { &(*ptrs.aarr_tail).header },
+        };
+
+        Ok(header.get_free() == 0)
     }
 
     /// Closes and Deletes the [`OsFile`]
@@ -234,7 +263,7 @@ impl Index {
 // Grow Kinds
 //
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum GrowKind {
     BitMap,
     AdjArr,
