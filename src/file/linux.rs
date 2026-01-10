@@ -1,7 +1,8 @@
 use crate::errors::{GraveError, GraveResult};
 use libc::{
-    c_int, c_void, close, fdatasync, fstat, ftruncate, iovec, off_t, open, pread, pwrite, pwritev, size_t, stat,
-    unlink, EPERM, O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, S_IRUSR, S_IWUSR,
+    c_int, c_short, c_void, close, fcntl, fdatasync, flock, fstat, ftruncate, iovec, off_t, open, pread, pwrite,
+    pwritev, size_t, stat, unlink, EPERM, F_SETLKW, F_UNLCK, F_WRLCK, O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC,
+    SEEK_SET, S_IRUSR, S_IWUSR,
 };
 use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
@@ -14,13 +15,13 @@ unsafe impl Sync for File {}
 impl File {
     /// Creates a new [`File`] at given `Path`
     pub(super) unsafe fn new(path: &std::path::PathBuf) -> GraveResult<Self> {
-        let fd = Self::open_with_flags(path, Self::prep_flags(true))?;
+        let fd = open_with_flags(path, prep_flags(true))?;
         Ok(Self(fd))
     }
 
     /// Opens an existing [`File`] at given `Path`
     pub(super) unsafe fn open(path: &std::path::PathBuf) -> GraveResult<Self> {
-        let fd = Self::open_with_flags(path, Self::prep_flags(false))?;
+        let fd = open_with_flags(path, prep_flags(false))?;
         Ok(Self(fd))
     }
 
@@ -49,7 +50,7 @@ impl File {
     pub(super) unsafe fn sync(&self) -> GraveResult<()> {
         let res = fdatasync(self.fd() as c_int);
         if res != 0 {
-            return Self::last_os_error();
+            return last_os_error();
         }
 
         Ok(())
@@ -59,7 +60,7 @@ impl File {
     pub(super) unsafe fn close(&self) -> GraveResult<()> {
         let res = close(self.fd());
         if res != 0 {
-            return Self::last_os_error();
+            return last_os_error();
         }
 
         Ok(())
@@ -73,10 +74,10 @@ impl File {
         // sanity check
         debug_assert!(self.close().is_err(), "File must be closed before trying to unlink");
 
-        let cpath = File::path_to_cstring(path)?;
+        let cpath = path_to_cstring(path)?;
         let res = unlink(cpath.as_ptr());
         if res != 0 {
-            return Self::last_os_error();
+            return last_os_error();
         }
 
         Ok(())
@@ -90,7 +91,7 @@ impl File {
     pub(super) unsafe fn ftruncate(&self, len: usize) -> GraveResult<()> {
         let res = ftruncate(self.fd(), len as off_t);
         if res != 0 {
-            return Self::last_os_error();
+            return last_os_error();
         }
 
         Ok(())
@@ -230,31 +231,68 @@ impl File {
         Ok(())
     }
 
+    /// Acquire an exclusive (write lock) to the [`File`]
+    pub(super) unsafe fn lock(&self) -> GraveResult<()> {
+        self.lock_impl(F_WRLCK)
+    }
+
+    /// Release lock (shared/exclusive) from the [`File`]
+    pub(super) unsafe fn unlock(&self) -> GraveResult<()> {
+        self.lock_impl(F_UNLCK)
+    }
+
+    #[inline]
+    unsafe fn lock_impl(&self, tp: c_int) -> GraveResult<()> {
+        let mut fl = flock {
+            l_type: tp as c_short,
+            l_whence: SEEK_SET as c_short,
+            l_start: 0,
+            l_len: 0, // whole file
+            l_pid: 0,
+        };
+
+        loop {
+            let res = fcntl(self.fd(), F_SETLKW, &mut fl);
+            if res == 0 {
+                return Ok(());
+            }
+
+            // NOTE: We must retry on interuption errors (EINTR retry)
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+    }
+
     /// Fetches metadata for [`File`] via `fstat` syscall
     unsafe fn stats(&self) -> GraveResult<stat> {
         let mut st = std::mem::zeroed::<stat>();
         let res = fstat(self.fd(), &mut st);
         if res != 0 {
-            return Self::last_os_error();
+            return last_os_error();
         }
 
         Ok(st)
     }
+}
 
-    /// Creates/opens a [`File`] w/ provided `flags`
-    ///
-    /// ## Limitations on Use of `O_NOATIME` (`EPERM` Error)
-    ///
-    /// `open()` with `O_NOATIME` may fail with `EPERM` instead of silently ignoring the flag
-    ///
-    /// `EPERM` indicates a kernel level permission violation, as the kernel rejects the
-    /// request outright, even though the flag only affects metadata behavior
-    ///
-    /// To remain sane across ownership models, containers, and shared filesystems,
-    /// we explicitly retry the `open()` w/o `O_NOATIME` when `EPERM` is encountered
-    unsafe fn open_with_flags(path: &std::path::PathBuf, flags: i32) -> GraveResult<i32> {
-        let cpath = File::path_to_cstring(path)?;
+/// Creates/opens a [`File`] w/ provided `flags`
+///
+/// ## Caveats of `O_NOATIME` (`EPERM` Error)
+///
+/// `open()` with `O_NOATIME` may fail with `EPERM` instead of silently ignoring the flag
+///
+/// `EPERM` indicates a kernel level permission violation, as the kernel rejects the
+/// request outright, even though the flag only affects metadata behavior
+///
+/// To remain sane across ownership models, containers, and shared filesystems,
+/// we explicitly retry the `open()` w/o `O_NOATIME` when `EPERM` is encountered
+unsafe fn open_with_flags(path: &std::path::PathBuf, flags: i32) -> GraveResult<i32> {
+    let cpath = path_to_cstring(path)?;
 
+    loop {
         let fd = if flags & O_CREAT != 0 {
             open(
                 cpath.as_ptr(),
@@ -270,6 +308,13 @@ impl File {
         }
 
         let err = std::io::Error::last_os_error();
+
+        // NOTE: We must retry on interuption errors (EINTR retry)
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+
+        // NOTE: Fallback for `EPERM` error!
         if err.raw_os_error() == Some(EPERM) {
             #[cfg(test)]
             debug_assert!((flags & O_NOATIME) != 0, "O_NOATIME flag is not being used");
@@ -280,37 +325,37 @@ impl File {
             }
         }
 
-        Err(err.into())
+        return Err(err.into());
     }
+}
 
-    /// Prepares kernel flags for syscall
-    ///
-    /// ## Access Time Updates (O_NOATIME)
-    ///
-    /// We use the `O_NOATIME` flag to disable access time updates on the [File]
-    /// Normally every I/O operation triggers an `atime` update/write to disk
-    ///
-    /// This is counter productive and increases latency for I/O ops in our case!
-    ///
-    /// ## Limitations of `O_NOATIME`
-    ///
-    /// Not all filesystems support this flag, on many it is silently ignored, but some rejects
-    /// it with `EPERM` error
-    ///
-    /// Also, this flag only works when UID's match for calling processe and file owner
-    const fn prep_flags(is_new: bool) -> i32 {
-        const BASE: i32 = O_RDWR | O_NOATIME | O_CLOEXEC;
-        const NEW: i32 = O_CREAT | O_TRUNC;
-        BASE | ((is_new as i32) * NEW)
-    }
+/// Prepares kernel flags for syscall
+///
+/// ## Access Time Updates (O_NOATIME)
+///
+/// We use the `O_NOATIME` flag to disable access time updates on the [`File`]
+/// Normally every I/O operation triggers an `atime` update/write to disk
+///
+/// This is counter productive and increases latency for I/O ops in our case!
+///
+/// ## Limitations of `O_NOATIME`
+///
+/// Not all filesystems support this flag, on many it is silently ignored, but some rejects
+/// it with `EPERM` error
+///
+/// Also, this flag only works when UID's match for calling processe and file owner
+const fn prep_flags(is_new: bool) -> i32 {
+    const BASE: i32 = O_RDWR | O_NOATIME | O_CLOEXEC;
+    const NEW: i32 = O_CREAT | O_TRUNC;
+    BASE | ((is_new as i32) * NEW)
+}
 
-    fn path_to_cstring(path: &std::path::PathBuf) -> GraveResult<CString> {
-        CString::new(path.as_os_str().as_bytes()).map_err(|e| GraveError::IO(format!("Error due to invalid Path: {e}")))
-    }
+fn path_to_cstring(path: &std::path::PathBuf) -> GraveResult<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|e| GraveError::IO(format!("Error due to invalid Path: {e}")))
+}
 
-    fn last_os_error<T>() -> GraveResult<T> {
-        Err(std::io::Error::last_os_error().into())
-    }
+fn last_os_error<T>() -> GraveResult<T> {
+    Err(std::io::Error::last_os_error().into())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -613,6 +658,70 @@ mod tests {
                 }
 
                 assert!(file.close().is_ok(), "failed to close the file");
+            }
+        }
+    }
+
+    mod lock_unlock {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[test]
+        fn lock_unlock_cycle() {
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("lock_file");
+
+            unsafe {
+                let f1 = File::new(&path).expect("file");
+
+                assert!(f1.lock().is_ok());
+                assert!(f1.unlock().is_ok());
+
+                assert!(f1.lock().is_ok());
+                assert!(f1.unlock().is_ok());
+            }
+        }
+
+        #[test]
+        fn lock_gives_exclusive_access_to_file() {
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("lock_file");
+            static ENTERED: AtomicBool = AtomicBool::new(false);
+
+            unsafe {
+                let f1 = File::new(&path).expect("file");
+                let f2 = File::open(&path).expect("file");
+
+                assert!(f1.lock().is_ok());
+                let t = std::thread::spawn(move || {
+                    ENTERED.store(true, Ordering::SeqCst);
+                    assert!(f2.lock().is_ok());
+                    assert!(f2.unlock().is_ok());
+                });
+
+                // wait until thread definitely attempted lock
+                while !ENTERED.load(Ordering::SeqCst) {}
+                std::thread::sleep(std::time::Duration::from_millis(50));
+
+                assert!(f1.unlock().is_ok());
+                assert!(t.join().is_ok());
+            }
+        }
+
+        #[test]
+        fn lock_survives_io() {
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("lock_file");
+
+            unsafe {
+                let f1 = File::new(&path).expect("file");
+
+                f1.lock().expect("lock");
+
+                let data = [1u8; 16];
+                f1.pwrite(data.as_ptr(), 0, 16).expect("write");
+
+                f1.unlock().expect("unlock");
             }
         }
     }

@@ -101,6 +101,26 @@ impl OsFile {
         }
     }
 
+    pub(crate) fn lock(&self) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.file.lock()
+        }
+    }
+
+    pub(crate) fn unlock(&self) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.file.unlock()
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn read(&self, ptr: *mut u8, off: usize, len: usize) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
@@ -485,6 +505,75 @@ mod tests {
             }
 
             assert!(file.close().is_ok(), "failed to close file");
+        }
+    }
+
+    mod lock_unlock {
+        use super::*;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        #[test]
+        fn lock_unlock_cycle() {
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("lock_file");
+
+            let file = OsFile::new(&path).expect("create file");
+
+            assert!(file.lock().is_ok());
+            assert!(file.unlock().is_ok());
+
+            assert!(file.lock().is_ok());
+            assert!(file.unlock().is_ok());
+
+            assert!(file.close().is_ok());
+        }
+
+        #[test]
+        fn lock_is_exclusive_across_handles() {
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("lock_file");
+
+            static ENTERED: AtomicBool = AtomicBool::new(false);
+
+            let f1 = OsFile::new(&path).expect("create file");
+            let f2 = OsFile::open(&path).expect("open file");
+
+            assert!(f1.lock().is_ok());
+
+            let t = std::thread::spawn(move || {
+                ENTERED.store(true, Ordering::SeqCst);
+                assert!(f2.lock().is_ok());
+                assert!(f2.unlock().is_ok());
+            });
+
+            while !ENTERED.load(Ordering::SeqCst) {}
+
+            // if lock is broken, thread would have passed already
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            assert!(f1.unlock().is_ok());
+            assert!(t.join().is_ok());
+
+            assert!(f1.close().is_ok());
+        }
+
+        #[test]
+        fn lock_survives_io() {
+            let dir = tempdir().expect("temp dir");
+            let path = dir.path().join("lock_file");
+
+            let file = OsFile::new(&path).expect("create file");
+
+            assert!(file.lock().is_ok());
+
+            let data = [0xAAu8; 16];
+            assert!(file.write(data.as_ptr(), 0, 16).is_ok());
+
+            assert!(file.unlock().is_ok());
+            assert!(file.close().is_ok());
         }
     }
 }

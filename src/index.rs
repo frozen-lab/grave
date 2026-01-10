@@ -155,6 +155,23 @@ impl Index {
         unsafe { (*self.ptrs.meta).total_entries as usize }
     }
 
+    fn grow(&self) -> GraveResult<()> {
+        // unmap the current mmap, then grow file and then re-map again
+
+        // 2x of the current size of blocks, e.g. 2 => 4 blocks, etc.
+        let new_file_len = {
+            let curr = self.file.len()?;
+            curr + (curr - METADATA_SIZE)
+        };
+
+        self.file.zero_extend(new_file_len)?;
+        self.mmap.unmap()?;
+
+        let new_map = MemMap::map(&self.file, new_file_len)?;
+
+        Ok(())
+    }
+
     /// Closes and Deletes the [`OsFile`]
     ///
     /// ## Why
