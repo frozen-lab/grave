@@ -26,6 +26,12 @@ impl std::fmt::Display for OsFile {
 }
 
 impl OsFile {
+    /// Creates a new [`OsFile`] at given `Path`
+    ///
+    /// ## RAII Safe
+    ///
+    /// The file handle (`fd` on `Linux`), is tied to the [`OsFile`] itself, hence the
+    /// underlying resource is automatically released when [`OsFile`] goes out of scope
     pub(crate) fn new(path: &std::path::PathBuf) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let file = ();
@@ -36,6 +42,12 @@ impl OsFile {
         Ok(Self { file })
     }
 
+    /// Opens an existing [`OsFile`] at given `Path`
+    ///
+    /// ## RAII Safe
+    ///
+    /// The file handle (`fd` on `Linux`), is tied to the [`OsFile`] itself, hence the
+    /// underlying resource is automatically released when [`OsFile`] goes out of scope    
     pub(crate) fn open(path: &std::path::PathBuf) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let file = ();
@@ -46,31 +58,27 @@ impl OsFile {
         Ok(Self { file })
     }
 
+    /// Fetches file handle for [`OsFile`] (**Linux Only**)
     #[cfg(target_os = "linux")]
     pub(crate) fn fd(&self) -> i32 {
         self.file.fd()
     }
 
-    pub(crate) fn close(&self) -> GraveResult<()> {
-        #[cfg(not(target_os = "linux"))]
-        unimplemented!();
-
-        #[cfg(target_os = "linux")]
-        unsafe {
-            self.file.close()
-        }
-    }
-
+    /// Close + Delete [`OsFile`] at given [`Path`]
     pub(crate) fn delete(&self, path: &std::path::PathBuf) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.unlink(path)
+            match self.file.close() {
+                Err(e) => Err(e),
+                Ok(_) => self.file.unlink(path),
+            }
         }
     }
 
+    /// Syncs dirty pages of [`OsFile`] to disk
     pub(crate) fn sync(&self) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
@@ -81,6 +89,10 @@ impl OsFile {
         }
     }
 
+    /// Truncates/extends length of [`OsFile`]
+    ///
+    /// **WARN:** If `len` is smaller then the current length of [`OsFile`] it'll be shrinked,
+    /// which may result in data loss
     pub(crate) fn zero_extend(&self, new_len: usize) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
@@ -91,6 +103,7 @@ impl OsFile {
         }
     }
 
+    /// Fetches current length of [`OsFile`]
     pub(crate) fn len(&self) -> GraveResult<usize> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
@@ -119,16 +132,7 @@ impl OsFile {
         }
     }
 
-    fn unlock(&self) -> GraveResult<()> {
-        #[cfg(not(target_os = "linux"))]
-        unimplemented!();
-
-        #[cfg(target_os = "linux")]
-        unsafe {
-            self.file.unlock()
-        }
-    }
-
+    /// Performs a blocking read from [`OsFile`]
     #[inline(always)]
     pub(crate) fn read(&self, ptr: *mut u8, off: usize, len: usize) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
@@ -140,6 +144,7 @@ impl OsFile {
         }
     }
 
+    /// Performs **single page** blocking write to [`OsFile`]
     #[inline(always)]
     pub(crate) fn write(&self, ptr: *const u8, off: usize, page_size: usize) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
@@ -151,6 +156,7 @@ impl OsFile {
         }
     }
 
+    /// Performs **multi page** blocking write to [`OsFile`]
     #[inline(always)]
     pub(crate) fn writev(&self, ptr: &[*const u8], off: usize, page_size: usize) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
@@ -160,6 +166,32 @@ impl OsFile {
         unsafe {
             self.file.pwritev(ptr, off, page_size)
         }
+    }
+
+    fn unlock(&self) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.file.unlock()
+        }
+    }
+
+    fn close(&self) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.file.close()
+        }
+    }
+}
+
+impl Drop for OsFile {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 
@@ -229,7 +261,6 @@ mod tests {
         assert!(file.sync().is_ok(), "fdatasync failed");
 
         assert_eq!(file.len().expect("read file len"), PAGE_SIZE * 2, "file len mismatch");
-        assert!(file.close().is_ok(), "failed to close file");
 
         let data = std::fs::read(&path).expect("read file");
         assert!(data.iter().all(|b| *b == 0), "file must be zero extended");
@@ -254,7 +285,6 @@ mod tests {
             let file = OsFile::new(&tmp).expect("open existing file");
 
             // close + unlink
-            assert!(file.close().is_ok(), "failed to close the file");
             assert!(file.delete(&tmp).is_ok(), "failed to unlink the file");
 
             // sanity check

@@ -148,7 +148,6 @@ mod tests {
         assert!(!map.ptr.is_null());
 
         unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
-        assert!(file.close().is_ok(), "failed to close the file");
     }
 
     #[test]
@@ -169,8 +168,6 @@ mod tests {
             assert!(map.unmap().is_ok(), "failed to unmap");
             assert!(map.unmap().is_ok(), "should not fail");
         }
-
-        assert!(file.close().is_ok(), "failed to close the file");
     }
 
     #[test]
@@ -181,7 +178,6 @@ mod tests {
         assert!(unsafe { map.sync().is_ok() }, "sync failed");
 
         unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
-        assert!(file.close().is_ok(), "failed to close the file");
     }
 
     #[test]
@@ -192,7 +188,6 @@ mod tests {
         assert!(unsafe { map.async_sync().is_ok() }, "async sync failed");
 
         unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
-        assert!(file.close().is_ok(), "failed to close the file");
     }
 
     mod write_read {
@@ -217,7 +212,6 @@ mod tests {
             }
 
             unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
-            assert!(file.close().is_ok(), "failed to close the file");
         }
 
         #[test]
@@ -238,7 +232,6 @@ mod tests {
                 map.sync().expect("sync failed");
 
                 unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
-                assert!(file.close().is_ok(), "failed to close the file");
             }
 
             // open_file + mmap + read
@@ -250,7 +243,6 @@ mod tests {
                 assert_eq!(val, 0xDEAD_C0DE_DEAD_C0DE);
 
                 unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
-                assert!(file.close().is_ok(), "failed to close the file");
             }
         }
 
@@ -274,7 +266,6 @@ mod tests {
             }
 
             unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
-            assert!(file.close().is_ok(), "failed to close the file");
         }
     }
 }

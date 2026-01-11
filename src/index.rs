@@ -116,31 +116,18 @@ impl Index {
         // S2: Read and validate len
         let file_len = file.len()?;
         if file_len <= METADATA_SIZE || (file_len - METADATA_SIZE) % BLOCK_SIZE != 0 {
-            // NOTE: Closing the file to avoid resource leak on error path. This is important
-            // becuase, as the [`Index`] was never fully constructed, so drop is never called.
-            //
-            // HACK: We consume the close error as we are already in an errored state, and the og
-            // error should get more priority
-            let _ = file.close();
-
             return Err(GraveError::InvalidState(format!(
                 "Index file has invalid len={file_len}"
             )));
         }
 
         // S3: MMap file
-        let mmap = MemMap::map(&file, file_len).map_err(|e| {
-            // same as above
-            let _ = file.close();
-            e
-        })?;
+        let mmap = MemMap::map(&file, file_len)?;
 
         // S4: Read & Validate Metadata
         let meta_reader = mmap.reader::<Metadata>(METADATA_OFF);
         let metadata = meta_reader.read();
         if metadata.version != VERSION || metadata.magic != MAGIC {
-            // same as above
-            let _ = file.close();
             return Err(GraveError::InvalidState("Invalid metadata for Index file".into()));
         }
 
@@ -150,6 +137,18 @@ impl Index {
             lock: RwLock::new(()),
             file,
         })
+    }
+
+    fn is_tail_block_full(&self, kind: GrowKind) -> GraveResult<bool> {
+        let _r = self.lock.read()?;
+        let ptrs = unsafe { &*self.ptrs.get() };
+
+        let header = match kind {
+            GrowKind::BitMap => unsafe { &(*ptrs.bmap_tail).header },
+            GrowKind::AdjArr => unsafe { &(*ptrs.aarr_tail).header },
+        };
+
+        Ok(header.get_free() == 0)
     }
 
     fn grow(&self, kind: GrowKind) -> GraveResult<()> {
@@ -172,10 +171,10 @@ impl Index {
         // NOTE: the file locks are RAII, hence the underlying resource is released
         // automatically when the value is dropped. So, We just ball ^0^
 
-        self._grow_locked(kind)
+        self.grow_locked(kind)
     }
 
-    fn _grow_locked(&self, kind: GrowKind) -> GraveResult<()> {
+    fn grow_locked(&self, kind: GrowKind) -> GraveResult<()> {
         // S0: Get an exclusive (cross-process) access to [`Index`]
         let mmap = unsafe { &mut *self.mmap.get() };
 
@@ -226,18 +225,6 @@ impl Index {
         Ok(())
     }
 
-    fn is_tail_block_full(&self, kind: GrowKind) -> GraveResult<bool> {
-        let _r = self.lock.read()?;
-        let ptrs = unsafe { &*self.ptrs.get() };
-
-        let header = match kind {
-            GrowKind::BitMap => unsafe { &(*ptrs.bmap_tail).header },
-            GrowKind::AdjArr => unsafe { &(*ptrs.aarr_tail).header },
-        };
-
-        Ok(header.get_free() == 0)
-    }
-
     /// Closes and Deletes the [`OsFile`]
     ///
     /// ## Why
@@ -253,9 +240,7 @@ impl Index {
     /// Any thrown I/O errors are supressed, as this function will be called in an already errored state
     /// where the original error should get more privilege.
     fn clear_file(file: &OsFile, filepath: &std::path::PathBuf) {
-        if file.close().is_ok() {
-            file.delete(filepath);
-        }
+        file.delete(filepath);
     }
 }
 

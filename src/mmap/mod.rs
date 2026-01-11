@@ -188,7 +188,6 @@ mod tests {
         assert_eq!(mmap.len(), PAGE_SIZE);
 
         assert!(mmap.unmap().is_ok(), "unmap failed");
-        assert!(file.close().is_ok(), "close failed");
     }
 
     #[test]
@@ -199,7 +198,6 @@ mod tests {
         assert!(mmap.sync().is_ok(), "sync failed");
 
         assert!(mmap.unmap().is_ok());
-        assert!(file.close().is_ok());
     }
 
     mod write_read {
@@ -222,7 +220,6 @@ mod tests {
             }
 
             assert!(mmap.unmap().is_ok());
-            assert!(file.close().is_ok());
         }
 
         #[test]
@@ -241,7 +238,6 @@ mod tests {
                 mmap.sync().expect("failed to sync");
 
                 assert!(mmap.unmap().is_ok());
-                assert!(file.close().is_ok());
             }
 
             // open_file + mmap + read
@@ -253,7 +249,6 @@ mod tests {
                 assert_eq!(*r.read(), 0xAABBCCDDEEFF0011);
 
                 assert!(mmap.unmap().is_ok());
-                assert!(file.close().is_ok());
             }
         }
 
@@ -276,7 +271,6 @@ mod tests {
             }
 
             assert!(mmap.unmap().is_ok());
-            assert!(file.close().is_ok());
         }
     }
 
@@ -305,7 +299,6 @@ mod tests {
             }
 
             assert!(mmap.unmap().is_ok());
-            assert!(file.close().is_ok());
         }
 
         #[test]
@@ -336,7 +329,6 @@ mod tests {
             }
 
             assert!(mmap.unmap().is_ok());
-            assert!(file.close().is_ok());
         }
     }
 }
