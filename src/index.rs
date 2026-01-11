@@ -1,11 +1,10 @@
-use std::{cell::UnsafeCell, sync::RwLock};
-
 use crate::{
     file::OsFile,
     hints::unlikely,
     mmap::{MemMap, MemMapReader},
     GraveConfig, GraveError, GraveResult,
 };
+use std::{cell::UnsafeCell, sync::RwLock};
 
 const VERSION: u32 = 0;
 const MAGIC: [u8; 4] = *b"indx";
@@ -32,7 +31,6 @@ pub(crate) struct Index {
     file: OsFile,
     lock: RwLock<()>,
     mmap: UnsafeCell<MemMap>,
-    ptrs: UnsafeCell<IndexPtrs>,
 }
 
 impl Index {
@@ -97,10 +95,9 @@ impl Index {
         }
 
         Ok(Self {
-            ptrs: UnsafeCell::new(IndexPtrs::new(&mmap)),
-            mmap: UnsafeCell::new(mmap),
-            lock: RwLock::new(()),
             file,
+            lock: RwLock::new(()),
+            mmap: UnsafeCell::new(mmap),
         })
     }
 
@@ -127,13 +124,14 @@ impl Index {
 
         // S4: Read & Validate Metadata
         let meta_reader = mmap.reader::<Metadata>(METADATA_OFF);
-        let metadata = meta_reader.read();
-        if metadata.version != VERSION || metadata.magic != MAGIC {
-            return Err(GraveError::InvalidState("Invalid metadata for Index file".into()));
-        }
+        meta_reader.read(|meta| {
+            if meta.version != VERSION || meta.magic != MAGIC {
+                return Err(GraveError::InvalidState("Invalid metadata for Index file".into()));
+            }
+            return Ok(());
+        })?;
 
         Ok(Self {
-            ptrs: UnsafeCell::new(IndexPtrs::new(&mmap)),
             mmap: UnsafeCell::new(mmap),
             lock: RwLock::new(()),
             file,
@@ -143,33 +141,32 @@ impl Index {
     /// **NOTE:** dummy impl
     #[inline]
     pub(crate) fn alloc_single_slot(&self) {
-        let ptrs = unsafe { &mut *self.ptrs.get() };
-        let bitmap = ptrs.bmap_tail;
-
-        let _idx = unsafe { (*bitmap).alloc_single() };
+        let block_idx = self.meta_read(|a| a.bmap_tail_idx);
+        let writer = unsafe { (*self.mmap.get()).writer::<BitMap>(METADATA_SIZE + (block_idx as usize * BLOCK_SIZE)) };
+        let _slot_idx = writer.write(|bmap| bmap.alloc_single());
     }
 
     /// **NOTE:** dummy impl
     #[inline]
     pub(crate) fn free_single_slot(&self, slot: usize) {
-        let ptrs = unsafe { &mut *self.ptrs.get() };
-        let bitmap = ptrs.bmap_tail;
-
-        unsafe {
-            (*bitmap).free_single(slot as u16);
-        };
+        let block_idx = 2; // calculate based on the slot
+        let writer = unsafe { (*self.mmap.get()).writer::<BitMap>(METADATA_SIZE + (block_idx as usize * BLOCK_SIZE)) };
+        let _slot_idx = writer.write(|bmap| bmap.free_single(slot as u16));
     }
 
     fn is_tail_block_full(&self, kind: GrowKind) -> GraveResult<bool> {
         let _r = self.lock.read()?;
-        let ptrs = unsafe { &*self.ptrs.get() };
 
-        let header = match kind {
-            GrowKind::BitMap => unsafe { &(*ptrs.bmap_tail).header },
-            GrowKind::AdjArr => unsafe { &(*ptrs.aarr_tail).header },
+        let (bmap_tail_idx, aarr_tail_idx) = self.meta_read(|a| (a.bmap_tail_idx, a.aarr_tail_idx));
+        let block_offset = match kind {
+            GrowKind::BitMap => METADATA_SIZE + (bmap_tail_idx as usize * BLOCK_SIZE),
+            GrowKind::AdjArr => METADATA_SIZE + (aarr_tail_idx as usize * BLOCK_SIZE),
         };
 
-        Ok(header.get_free() == 0)
+        let reader = unsafe { (*self.mmap.get()).reader::<BlockHeader>(block_offset) };
+        let free_count = reader.read(|header| header.get_free());
+
+        Ok(free_count == 0)
     }
 
     fn grow(&self, kind: GrowKind) -> GraveResult<()> {
@@ -214,11 +211,12 @@ impl Index {
         *mmap = MemMap::map(&self.file, new_len)?;
 
         // S3: update current & new tail
-        let meta = mmap.get_mut::<Metadata>(METADATA_OFF);
-        let (tail_idx, flag) = match kind {
+        let meta = mmap.reader::<Metadata>(METADATA_OFF);
+        let (tail_idx, flag) = meta.read(|meta| match kind {
             GrowKind::BitMap => (unsafe { (*meta).bmap_tail_idx }, BlockHeaderFlag::BITMAP),
             GrowKind::AdjArr => (unsafe { (*meta).aarr_tail_idx }, BlockHeaderFlag::ADJARR),
-        };
+        });
+
         let old_tail_off = METADATA_SIZE + tail_idx as usize * BLOCK_SIZE;
         let new_tail_off = METADATA_SIZE + new_block_idx as usize * BLOCK_SIZE;
 
@@ -229,21 +227,31 @@ impl Index {
 
         // S4: Update metadata & rebuild index pointers
         unsafe {
-            // NOTE: Metadata must be updated before rebulding the index pointers
-
-            // meta update
-            match kind {
-                GrowKind::BitMap => (*meta).bmap_tail_idx = new_block_idx,
-                GrowKind::AdjArr => (*meta).aarr_tail_idx = new_block_idx,
-            }
-            (*meta).num_block += 1;
-            (*meta).current_cap += PAGES_PER_BLOCK as u64;
-
-            // rebuild idx ptrs
-            *self.ptrs.get() = IndexPtrs::new(mmap);
+            self.meta_write(|meta| {
+                match kind {
+                    GrowKind::BitMap => {
+                        meta.current_cap += PAGES_PER_BLOCK as u64;
+                        meta.bmap_tail_idx = new_block_idx;
+                    }
+                    GrowKind::AdjArr => {
+                        meta.aarr_tail_idx = new_block_idx;
+                    }
+                }
+                meta.num_block += 1;
+            });
         }
 
         Ok(())
+    }
+
+    #[inline]
+    fn meta_read<R>(&self, f: impl FnOnce(&Metadata) -> R) -> R {
+        unsafe { (*self.mmap.get()).reader::<Metadata>(METADATA_OFF).read(f) }
+    }
+
+    #[inline]
+    fn meta_write<R>(&self, f: impl FnOnce(&mut Metadata) -> R) -> R {
+        unsafe { (*self.mmap.get()).writer::<Metadata>(METADATA_OFF).write(f) }
     }
 
     /// Closes and Deletes the [`OsFile`]
@@ -273,37 +281,6 @@ impl Index {
 enum GrowKind {
     BitMap,
     AdjArr,
-}
-
-//
-// Index Pointers
-//
-
-#[derive(Debug)]
-struct IndexPtrs {
-    meta: *mut Metadata,
-    bmap_tail: *mut BitMap,
-    aarr_tail: *mut AdjArr,
-}
-
-impl IndexPtrs {
-    /// Init [`IndexPtrs`] to hold cached pointers to block in [`MMap`]
-    ///
-    /// ## Safety Rule
-    ///
-    /// When [`Index::grow`] is triggered, the [`Metadata`] must always be
-    /// updated before trying to re-build the [`IndexPtrs`].
-    fn new(mmap: &MemMap) -> Self {
-        let meta = mmap.get_mut::<Metadata>(METADATA_OFF);
-        let bmap_idx = unsafe { (*meta).bmap_tail_idx as usize };
-        let aarr_idx = unsafe { (*meta).aarr_tail_idx as usize };
-
-        Self {
-            meta,
-            bmap_tail: mmap.get_mut::<BitMap>(METADATA_SIZE + bmap_idx * BLOCK_SIZE),
-            aarr_tail: mmap.get_mut::<AdjArr>(METADATA_SIZE + aarr_idx * BLOCK_SIZE),
-        }
-    }
 }
 
 //
