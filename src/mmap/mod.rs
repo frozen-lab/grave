@@ -1,12 +1,18 @@
 use crate::{errors::GraveResult, file::OsFile};
+use std::{
+    mem::ManuallyDrop,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(target_os = "linux")]
 mod linux;
 
 #[derive(Debug)]
 pub(crate) struct MemMap {
+    dropped: AtomicBool,
+
     #[cfg(target_os = "linux")]
-    mmap: linux::MMap,
+    mmap: ManuallyDrop<linux::MMap>,
 
     #[cfg(not(target_os = "linux"))]
     mmap: (),
@@ -26,6 +32,7 @@ impl std::fmt::Display for MemMap {
 }
 
 impl MemMap {
+    /// Create a memory mapping as [`MemMap`] for the given [`OsFile`]
     pub(crate) fn map(file: &OsFile, len: usize) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let mmap = ();
@@ -33,19 +40,37 @@ impl MemMap {
         #[cfg(target_os = "linux")]
         let mmap = unsafe { linux::MMap::map(file.fd(), len) }?;
 
-        Ok(Self { mmap })
+        Ok(Self {
+            mmap: ManuallyDrop::new(mmap),
+            dropped: AtomicBool::new(false),
+        })
     }
 
-    pub(crate) fn unmap(&self) -> GraveResult<()> {
+    /// Unmap the mapped memory for [`MemMap`]
+    ///
+    /// ## Safety
+    ///
+    /// `unmap` is idempotent, hence calling it multiple times would not result into
+    /// any errors or UB
+    pub(crate) fn unmap(&mut self) -> GraveResult<()> {
+        // sanity protection to avoid unmap after unmap
+        if self.dropped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.mmap.unmap()
+            ManuallyDrop::take(&mut self.mmap).unmap()?;
         }
+
+        self.dropped.store(true, Ordering::Release);
+        Ok(())
     }
 
+    /// Syncs dirty pages of [`MemMap`] to disk
     #[inline]
     pub(crate) fn sync(&self) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
@@ -57,8 +82,9 @@ impl MemMap {
         }
     }
 
+    /// Fetches current length of [`MemMap`]
     #[inline]
-    pub(crate) const fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
@@ -67,7 +93,7 @@ impl MemMap {
     }
 
     #[inline]
-    pub(crate) const fn get<T>(&self, off: usize) -> *const T {
+    pub(crate) fn get<T>(&self, off: usize) -> *const T {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
@@ -78,7 +104,7 @@ impl MemMap {
     }
 
     #[inline]
-    pub(crate) const fn get_mut<T>(&self, off: usize) -> *mut T {
+    pub(crate) fn get_mut<T>(&self, off: usize) -> *mut T {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
@@ -89,7 +115,7 @@ impl MemMap {
     }
 
     #[inline]
-    pub(crate) const fn reader<'a, T>(&'a self, off: usize) -> MemMapReader<'a, T> {
+    pub(crate) fn reader<'a, T>(&'a self, off: usize) -> MemMapReader<'a, T> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
@@ -107,6 +133,14 @@ impl MemMap {
         #[cfg(target_os = "linux")]
         unsafe {
             MemMapWriter::new(self.mmap.get_mut::<T>(off))
+        }
+    }
+}
+
+impl Drop for MemMap {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.unmap();
         }
     }
 }
@@ -186,8 +220,6 @@ mod tests {
 
         let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
         assert_eq!(mmap.len(), PAGE_SIZE);
-
-        assert!(mmap.unmap().is_ok(), "unmap failed");
     }
 
     #[test]
@@ -196,8 +228,6 @@ mod tests {
         let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
 
         assert!(mmap.sync().is_ok(), "sync failed");
-
-        assert!(mmap.unmap().is_ok());
     }
 
     mod write_read {
@@ -218,8 +248,6 @@ mod tests {
                 let r = mmap.reader::<u64>(0);
                 assert_eq!(*r.read(), 0xDEAD_C0DE_DEAD_C0DE);
             }
-
-            assert!(mmap.unmap().is_ok());
         }
 
         #[test]
@@ -236,8 +264,6 @@ mod tests {
                 let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
                 mmap.writer::<u64>(0).write(|v| *v = 0xAABBCCDDEEFF0011);
                 mmap.sync().expect("failed to sync");
-
-                assert!(mmap.unmap().is_ok());
             }
 
             // open_file + mmap + read
@@ -247,8 +273,6 @@ mod tests {
 
                 let r = mmap.reader::<u64>(0);
                 assert_eq!(*r.read(), 0xAABBCCDDEEFF0011);
-
-                assert!(mmap.unmap().is_ok());
             }
         }
 
@@ -269,8 +293,6 @@ mod tests {
                 file.read(buf.as_mut_ptr(), 0, 8).expect("failed to read");
                 assert_eq!(u64::from_le_bytes(buf), 0xDEAD_C0DE_DEAD_C0DE);
             }
-
-            assert!(mmap.unmap().is_ok());
         }
     }
 
@@ -297,8 +319,6 @@ mod tests {
             for h in handles {
                 assert!(h.join().is_ok());
             }
-
-            assert!(mmap.unmap().is_ok());
         }
 
         #[test]
@@ -327,8 +347,6 @@ mod tests {
                 let r = mmap.reader::<u64>(i * PAGE_SIZE);
                 assert_eq!(*r.read(), i as u64);
             }
-
-            assert!(mmap.unmap().is_ok());
         }
     }
 }
