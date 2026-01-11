@@ -2,6 +2,7 @@ use std::{cell::UnsafeCell, sync::RwLock};
 
 use crate::{
     file::OsFile,
+    hints::unlikely,
     mmap::{MemMap, MemMapReader},
     GraveConfig, GraveError, GraveResult,
 };
@@ -137,6 +138,26 @@ impl Index {
             lock: RwLock::new(()),
             file,
         })
+    }
+
+    /// **NOTE:** dummy impl
+    #[inline]
+    pub(crate) fn alloc_single_slot(&self) {
+        let ptrs = unsafe { &mut *self.ptrs.get() };
+        let bitmap = ptrs.bmap_tail;
+
+        let _idx = unsafe { (*bitmap).alloc_single() };
+    }
+
+    /// **NOTE:** dummy impl
+    #[inline]
+    pub(crate) fn free_single_slot(&self, slot: usize) {
+        let ptrs = unsafe { &mut *self.ptrs.get() };
+        let bitmap = ptrs.bmap_tail;
+
+        unsafe {
+            (*bitmap).free_single(slot as u16);
+        };
     }
 
     fn is_tail_block_full(&self, kind: GrowKind) -> GraveResult<bool> {
@@ -446,6 +467,18 @@ impl BlockHeader {
     }
 
     #[inline]
+    const fn incr_free(&mut self, slots: u16) {
+        let old = self.get_free();
+        let new = old + slots;
+
+        // sanity check
+        debug_assert!(new <= 0x0FFF, "free overflow");
+
+        self.0[3] = (self.0[3] & 0xF0) | ((new >> 8) as u8 & 0x0F);
+        self.0[4] = (new & 0xFF) as u8;
+    }
+
+    #[inline]
     const fn set_nidx(&mut self, nidx: u32) {
         debug_assert!(nidx <= 0x07FF_FFFF, "nidx overflow (27 bits)");
 
@@ -470,6 +503,77 @@ struct BitMap {
 
 // sanity check
 const _: () = assert!(std::mem::size_of::<BitMap>() == BLOCK_SIZE);
+
+impl BitMap {
+    #[inline]
+    fn alloc_single(&mut self) -> Option<u16> {
+        // sanity check
+        debug_assert!(self.header.is_bitmap(), "Invalid block");
+
+        // current block is full
+        if unlikely(self.header.get_free() == 0) {
+            return None;
+        }
+
+        let nwords = self.words.len();
+        let start_word = self.header.get_cptr() as usize;
+
+        for word_off in 0..nwords {
+            let word_idx = (start_word + word_off) % nwords;
+            let word = &mut self.words[word_idx];
+
+            // curr_word is full (instant skip)
+            if *word == u16::MAX {
+                continue;
+            }
+
+            let free_bit = (!*word).trailing_zeros() as usize;
+            let bit = 1u16 << free_bit;
+
+            // sanity checks
+            debug_assert!((*word & bit) == 0, "bitmap corruption");
+            debug_assert!(free_bit < 0x10, "invalid trailing_zeros result");
+
+            // free => used
+            *word |= bit;
+            self.header.decr_free(1);
+            self.header.set_cptr(word_idx as u8);
+
+            let slot = word_idx * 0x10 + free_bit;
+
+            // sanity check
+            debug_assert!(slot < PAGES_PER_BLOCK, "slot is OOB");
+
+            return Some(slot as u16);
+        }
+
+        unreachable!()
+    }
+
+    #[inline]
+    fn free_single(&mut self, slot: u16) {
+        let free = self.header.get_free();
+        let slot = slot as usize;
+        let widx = slot / 0x10;
+        let bit = slot % 0x10;
+        let mask = 1u16 << bit;
+
+        // sanity checks
+        debug_assert!(slot < PAGES_PER_BLOCK, "slot is OOB");
+        debug_assert!(self.header.is_bitmap(), "invalid block");
+        debug_assert!(widx < self.words.len(), "word index OOB");
+        debug_assert!(free < PAGES_PER_BLOCK as u16, "free overflow");
+
+        let word = &mut self.words[widx];
+
+        // sanity check
+        debug_assert!((*word & mask) != 0, "double free or invalid slot");
+
+        // used => free
+        *word &= !mask;
+        self.header.incr_free(1);
+    }
+}
 
 //
 // AdjArr
