@@ -1,18 +1,16 @@
 use crate::{errors::GraveResult, file::OsFile};
-use std::{
-    mem::ManuallyDrop,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{mem, sync::atomic};
 
 #[cfg(target_os = "linux")]
 mod linux;
 
 #[derive(Debug)]
 pub(crate) struct MemMap {
-    dropped: AtomicBool,
+    version: atomic::AtomicU8,
+    dropped: atomic::AtomicBool,
 
     #[cfg(target_os = "linux")]
-    mmap: ManuallyDrop<linux::MMap>,
+    mmap: mem::ManuallyDrop<linux::MMap>,
 
     #[cfg(not(target_os = "linux"))]
     mmap: (),
@@ -41,8 +39,9 @@ impl MemMap {
         let mmap = unsafe { linux::MMap::map(file.fd(), len) }?;
 
         Ok(Self {
-            mmap: ManuallyDrop::new(mmap),
-            dropped: AtomicBool::new(false),
+            version: atomic::AtomicU8::new(0),
+            mmap: mem::ManuallyDrop::new(mmap),
+            dropped: atomic::AtomicBool::new(false),
         })
     }
 
@@ -54,7 +53,7 @@ impl MemMap {
     /// any errors or UB
     pub(crate) fn unmap(&mut self) -> GraveResult<()> {
         // sanity protection to avoid unmap after unmap
-        if self.dropped.load(Ordering::Acquire) {
+        if self.dropped.load(atomic::Ordering::Acquire) {
             return Ok(());
         }
 
@@ -63,10 +62,11 @@ impl MemMap {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            ManuallyDrop::take(&mut self.mmap).unmap()?;
+            mem::ManuallyDrop::take(&mut self.mmap).unmap()?;
         }
 
-        self.dropped.store(true, Ordering::Release);
+        self.version.fetch_add(1, atomic::Ordering::Release);
+        self.dropped.store(true, atomic::Ordering::Release);
         Ok(())
     }
 
@@ -93,35 +93,18 @@ impl MemMap {
     }
 
     #[inline]
-    pub(crate) fn get<T>(&self, off: usize) -> *const T {
-        #[cfg(not(target_os = "linux"))]
-        unimplemented!();
-
-        #[cfg(target_os = "linux")]
-        unsafe {
-            self.mmap.get(off)
-        }
-    }
-
-    #[inline]
-    pub(crate) fn get_mut<T>(&self, off: usize) -> *mut T {
-        #[cfg(not(target_os = "linux"))]
-        unimplemented!();
-
-        #[cfg(target_os = "linux")]
-        unsafe {
-            self.mmap.get_mut(off)
-        }
-    }
-
-    #[inline]
     pub(crate) fn reader<'a, T>(&'a self, off: usize) -> MemMapReader<'a, T> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
         unsafe {
-            MemMapReader::new(self.mmap.get::<T>(off))
+            let ptr = self.mmap.get::<T>(off);
+            MemMapReader {
+                ptr,
+                map: self,
+                version: self.version.load(atomic::Ordering::Acquire),
+            }
         }
     }
 
@@ -132,7 +115,12 @@ impl MemMap {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            MemMapWriter::new(self.mmap.get_mut::<T>(off))
+            let ptr = self.mmap.get_mut::<T>(off);
+            MemMapWriter {
+                ptr,
+                map: self,
+                version: self.version.load(atomic::Ordering::Acquire),
+            }
         }
     }
 }
@@ -151,22 +139,23 @@ impl Drop for MemMap {
 
 #[derive(Debug)]
 pub(crate) struct MemMapReader<'a, T> {
+    version: u8,
     ptr: *const T,
-    _pd: std::marker::PhantomData<&'a T>,
+    map: &'a MemMap,
 }
 
 impl<'a, T> MemMapReader<'a, T> {
     #[inline]
-    const fn new(ptr: *const T) -> Self {
-        Self {
-            ptr,
-            _pd: std::marker::PhantomData,
-        }
-    }
+    pub(crate) fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        // sanity check (to avoid use of pointers after unmap is done)
+        debug_assert!(!self.map.dropped.load(atomic::Ordering::Acquire));
+        debug_assert_eq!(
+            self.version,
+            self.map.version.load(atomic::Ordering::Acquire),
+            "detected use of pointer to unmapped memmap"
+        );
 
-    #[inline]
-    pub(crate) const fn read(&self) -> &T {
-        unsafe { &*self.ptr }
+        unsafe { f(&*self.ptr) }
     }
 }
 
@@ -176,21 +165,22 @@ impl<'a, T> MemMapReader<'a, T> {
 
 #[derive(Debug)]
 pub(crate) struct MemMapWriter<'a, T> {
+    version: u8,
     ptr: *mut T,
-    _pd: std::marker::PhantomData<&'a T>,
+    map: &'a MemMap,
 }
 
 impl<'a, T> MemMapWriter<'a, T> {
     #[inline]
-    const fn new(ptr: *mut T) -> Self {
-        Self {
-            ptr,
-            _pd: std::marker::PhantomData,
-        }
-    }
+    pub(crate) fn write<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        // sanity check (to avoid use of pointers after unmap is done)
+        debug_assert!(!self.map.dropped.load(atomic::Ordering::Acquire));
+        debug_assert_eq!(
+            self.version,
+            self.map.version.load(atomic::Ordering::Acquire),
+            "detected use of pointer to unmapped memmap"
+        );
 
-    #[inline]
-    pub(crate) fn write(&self, f: impl FnOnce(&mut T)) {
         unsafe { f(&mut *self.ptr) }
     }
 }
@@ -246,7 +236,7 @@ mod tests {
 
             {
                 let r = mmap.reader::<u64>(0);
-                assert_eq!(*r.read(), 0xDEAD_C0DE_DEAD_C0DE);
+                assert_eq!(r.read(|val| *val), 0xDEAD_C0DE_DEAD_C0DE);
             }
         }
 
@@ -272,7 +262,7 @@ mod tests {
                 let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
 
                 let r = mmap.reader::<u64>(0);
-                assert_eq!(*r.read(), 0xAABBCCDDEEFF0011);
+                assert_eq!(r.read(|val| *val), 0xAABBCCDDEEFF0011);
             }
         }
 
@@ -312,7 +302,7 @@ mod tests {
                 let mmap = Arc::clone(&mmap);
                 handles.push(thread::spawn(move || {
                     let r = mmap.reader::<u64>(0);
-                    assert_eq!(*r.read(), 0x1122334455667788);
+                    assert_eq!(r.read(|val| *val), 0x1122334455667788);
                 }));
             }
 
@@ -345,7 +335,7 @@ mod tests {
 
             for i in 0..N {
                 let r = mmap.reader::<u64>(i * PAGE_SIZE);
-                assert_eq!(*r.read(), i as u64);
+                assert_eq!(r.read(|val| *val), i as u64);
             }
         }
     }
