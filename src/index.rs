@@ -208,6 +208,7 @@ impl Index {
         // S2: unmap, zero_extend & remap
         mmap.unmap()?;
         self.file.zero_extend(new_len)?;
+        self.file.sync()?;
         *mmap = MemMap::map(&self.file, new_len)?;
 
         // S3: update current & new tail

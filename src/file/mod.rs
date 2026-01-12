@@ -12,9 +12,6 @@ pub(crate) struct OsFile {
     file: (),
 }
 
-unsafe impl Send for OsFile {}
-unsafe impl Sync for OsFile {}
-
 impl std::fmt::Display for OsFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         #[cfg(not(target_os = "linux"))]
@@ -188,6 +185,9 @@ impl OsFile {
         }
     }
 }
+
+unsafe impl Send for OsFile {}
+unsafe impl Sync for OsFile {}
 
 impl Drop for OsFile {
     fn drop(&mut self) {

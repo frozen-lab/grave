@@ -1,19 +1,33 @@
 use crate::{errors::GraveResult, file::OsFile};
-use std::{mem, sync::atomic};
+use std::{
+    cell, mem,
+    sync::{self, atomic, Arc},
+};
 
 #[cfg(target_os = "linux")]
 mod linux;
 
 #[derive(Debug)]
-pub(crate) struct MemMap {
+struct MapCore {
+    cv: sync::Condvar,
+    lock: sync::Mutex<()>,
     version: atomic::AtomicU8,
+    dirty: atomic::AtomicBool,
     dropped: atomic::AtomicBool,
 
     #[cfg(target_os = "linux")]
-    mmap: mem::ManuallyDrop<linux::MMap>,
+    mmap: cell::UnsafeCell<mem::ManuallyDrop<linux::MMap>>,
 
     #[cfg(not(target_os = "linux"))]
     mmap: (),
+}
+
+unsafe impl Sync for MapCore {}
+unsafe impl Send for MapCore {}
+
+#[derive(Debug)]
+pub(crate) struct MemMap {
+    core: Arc<MapCore>,
 }
 
 unsafe impl Send for MemMap {}
@@ -25,7 +39,13 @@ impl std::fmt::Display for MemMap {
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        write!(f, "GraveMMap {{len: {}}}", self.mmap.len())
+        write!(
+            f,
+            "GraveMMap {{len: {}, version: {}, dropped: {}}}",
+            unsafe { mem::ManuallyDrop::take(&mut *self.core.mmap.get()).len() },
+            self.core.version.load(atomic::Ordering::Acquire),
+            self.core.dropped.load(atomic::Ordering::Acquire)
+        )
     }
 }
 
@@ -38,11 +58,17 @@ impl MemMap {
         #[cfg(target_os = "linux")]
         let mmap = unsafe { linux::MMap::map(file.fd(), len) }?;
 
-        Ok(Self {
+        let core = Arc::new(MapCore {
+            cv: sync::Condvar::new(),
+            lock: sync::Mutex::new(()),
             version: atomic::AtomicU8::new(0),
-            mmap: mem::ManuallyDrop::new(mmap),
+            dirty: atomic::AtomicBool::new(false),
             dropped: atomic::AtomicBool::new(false),
-        })
+            mmap: cell::UnsafeCell::new(mem::ManuallyDrop::new(mmap)),
+        });
+
+        Self::spawn_tx(core.clone());
+        Ok(Self { core })
     }
 
     /// Unmap the mapped memory for [`MemMap`]
@@ -53,7 +79,7 @@ impl MemMap {
     /// any errors or UB
     pub(crate) fn unmap(&mut self) -> GraveResult<()> {
         // sanity protection to avoid unmap after unmap
-        if self.dropped.load(atomic::Ordering::Acquire) {
+        if self.core.dropped.load(atomic::Ordering::Acquire) {
             return Ok(());
         }
 
@@ -62,12 +88,24 @@ impl MemMap {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            mem::ManuallyDrop::take(&mut self.mmap).unmap()?;
+            mem::ManuallyDrop::take(&mut *self.core.mmap.get()).unmap()?;
         }
 
-        self.version.fetch_add(1, atomic::Ordering::Release);
-        self.dropped.store(true, atomic::Ordering::Release);
+        self.core.version.fetch_add(1, atomic::Ordering::Release);
+        self.core.dropped.store(true, atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Fetches current length of [`MemMap`]
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            mem::ManuallyDrop::take(&mut *self.core.mmap.get()).len()
+        }
     }
 
     /// Syncs dirty pages of [`MemMap`] to disk
@@ -78,18 +116,8 @@ impl MemMap {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.mmap.sync()
+            (&*self.core.mmap.get()).sync()
         }
-    }
-
-    /// Fetches current length of [`MemMap`]
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        #[cfg(not(target_os = "linux"))]
-        unimplemented!();
-
-        #[cfg(target_os = "linux")]
-        self.mmap.len()
     }
 
     #[inline]
@@ -99,11 +127,11 @@ impl MemMap {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            let ptr = self.mmap.get::<T>(off);
+            let ptr = mem::ManuallyDrop::take(&mut *self.core.mmap.get()).get::<T>(off);
             MemMapReader {
                 ptr,
                 map: self,
-                version: self.version.load(atomic::Ordering::Acquire),
+                version: self.core.version.load(atomic::Ordering::Acquire),
             }
         }
     }
@@ -115,20 +143,57 @@ impl MemMap {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            let ptr = self.mmap.get_mut::<T>(off);
+            let ptr = mem::ManuallyDrop::take(&mut *self.core.mmap.get()).get_mut::<T>(off);
             MemMapWriter {
                 ptr,
                 map: self,
-                version: self.version.load(atomic::Ordering::Acquire),
+                version: self.core.version.load(atomic::Ordering::Acquire),
             }
         }
+    }
+
+    #[inline]
+    fn sync_internal(core: &MapCore) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            (&*core.mmap.get()).sync()
+        }
+    }
+
+    fn spawn_tx(core: Arc<MapCore>) {
+        std::thread::spawn(move || unsafe {
+            let mut guard = core.lock.lock().expect("mutex poisoned");
+
+            while !core.dropped.load(atomic::Ordering::Acquire) {
+                let (g, _) = core
+                    .cv
+                    .wait_timeout(guard, std::time::Duration::from_secs(1))
+                    .expect("condvar poisoned");
+                guard = g;
+            }
+
+            if core.dirty.swap(false, atomic::Ordering::AcqRel) {
+                drop(guard);
+                unsafe {
+                    let _ = (&*core.mmap.get()).sync();
+                }
+                guard = core.lock.lock().expect("mutex poisoned");
+            }
+        });
     }
 }
 
 impl Drop for MemMap {
     fn drop(&mut self) {
+        self.core.dropped.store(true, atomic::Ordering::Release);
+        self.core.cv.notify_one();
+
         unsafe {
-            let _ = self.unmap();
+            let _ = Self::sync_internal(&self.core);
+            let _ = mem::ManuallyDrop::take(&mut *self.core.mmap.get()).unmap();
         }
     }
 }
@@ -148,10 +213,10 @@ impl<'a, T> MemMapReader<'a, T> {
     #[inline]
     pub(crate) fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         // sanity check (to avoid use of pointers after unmap is done)
-        debug_assert!(!self.map.dropped.load(atomic::Ordering::Acquire));
+        debug_assert!(!self.map.core.dropped.load(atomic::Ordering::Acquire));
         debug_assert_eq!(
             self.version,
-            self.map.version.load(atomic::Ordering::Acquire),
+            self.map.core.version.load(atomic::Ordering::Acquire),
             "detected use of pointer to unmapped memmap"
         );
 
@@ -174,14 +239,18 @@ impl<'a, T> MemMapWriter<'a, T> {
     #[inline]
     pub(crate) fn write<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         // sanity check (to avoid use of pointers after unmap is done)
-        debug_assert!(!self.map.dropped.load(atomic::Ordering::Acquire));
+        debug_assert!(!self.map.core.dropped.load(atomic::Ordering::Acquire));
         debug_assert_eq!(
             self.version,
-            self.map.version.load(atomic::Ordering::Acquire),
+            self.map.core.version.load(atomic::Ordering::Acquire),
             "detected use of pointer to unmapped memmap"
         );
 
-        unsafe { f(&mut *self.ptr) }
+        let res = unsafe { f(&mut *self.ptr) };
+        self.map.core.dirty.store(true, atomic::Ordering::Release);
+        self.map.core.cv.notify_one();
+
+        res
     }
 }
 
