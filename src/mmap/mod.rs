@@ -1,4 +1,4 @@
-use crate::{errors::GraveResult, file::OsFile};
+use crate::{common::IOFlushMode, errors::GraveResult, file::OsFile};
 use std::{
     cell, mem,
     sync::{self, atomic, Arc},
@@ -9,9 +9,9 @@ mod linux;
 
 #[derive(Debug)]
 struct MapCore {
+    mode: IOFlushMode,
     cv: sync::Condvar,
     lock: sync::Mutex<()>,
-    mode: MemMapFlushMode,
     version: atomic::AtomicU8,
     dirty: atomic::AtomicBool,
     dropped: atomic::AtomicBool,
@@ -42,17 +42,18 @@ impl std::fmt::Display for MemMap {
         #[cfg(target_os = "linux")]
         write!(
             f,
-            "GraveMMap {{len: {}, version: {}, dropped: {}}}",
+            "GraveMMap {{len: {}, version: {}, dropped: {}, mode: {:?}}}",
             unsafe { mem::ManuallyDrop::take(&mut *self.core.mmap.get()).len() },
             self.core.version.load(atomic::Ordering::Acquire),
-            self.core.dropped.load(atomic::Ordering::Acquire)
+            self.core.dropped.load(atomic::Ordering::Acquire),
+            self.core.mode,
         )
     }
 }
 
 impl MemMap {
     /// Create a memory mapping as [`MemMap`] for the given [`OsFile`]
-    pub(crate) fn map(file: &OsFile, len: usize, mode: MemMapFlushMode) -> GraveResult<Self> {
+    pub(crate) fn map(file: &OsFile, len: usize, mode: IOFlushMode) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let mmap = ();
 
@@ -60,7 +61,7 @@ impl MemMap {
         let mmap = unsafe { linux::MMap::map(file.fd(), len) }?;
 
         let core = Arc::new(MapCore {
-            mode,
+            mode: mode.clone(),
             cv: sync::Condvar::new(),
             lock: sync::Mutex::new(()),
             version: atomic::AtomicU8::new(0),
@@ -69,7 +70,7 @@ impl MemMap {
             mmap: cell::UnsafeCell::new(mem::ManuallyDrop::new(mmap)),
         });
 
-        if mode == MemMapFlushMode::Background {
+        if mode == IOFlushMode::Background {
             Self::spawn_tx(core.clone());
         }
 
@@ -204,16 +205,6 @@ impl Drop for MemMap {
 }
 
 //
-// Flush modes
-//
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum MemMapFlushMode {
-    Background,
-    Immediate,
-}
-
-//
 // Reader
 //
 
@@ -263,10 +254,10 @@ impl<'a, T> MemMapWriter<'a, T> {
 
         let res = unsafe { f(&mut *self.ptr) };
         match self.map.core.mode {
-            MemMapFlushMode::Immediate => {
+            IOFlushMode::Immediate => {
                 let _ = self.map.sync();
             }
-            MemMapFlushMode::Background => {
+            IOFlushMode::Background => {
                 self.map.core.dirty.store(true, atomic::Ordering::Release);
                 self.map.core.cv.notify_one();
             }
@@ -284,7 +275,7 @@ mod tests {
     use tempfile::tempdir;
 
     const PAGE_SIZE: usize = 0x20;
-    const MODE: MemMapFlushMode = MemMapFlushMode::Immediate;
+    const MODE: IOFlushMode = IOFlushMode::Immediate;
 
     fn tmp_file(len: usize) -> OsFile {
         let dir = tempdir().expect("tmp dir");

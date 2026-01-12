@@ -32,3 +32,13 @@ fn test_sanity_of_unlikely_hint() {
     assert!(unlikely(true), "true should be true");
     assert!(!unlikely(false), "false should be false");
 }
+
+//
+// Flush modes
+//
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum IOFlushMode {
+    Background,
+    Immediate,
+}
