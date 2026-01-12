@@ -11,6 +11,7 @@ mod linux;
 struct MapCore {
     cv: sync::Condvar,
     lock: sync::Mutex<()>,
+    mode: MemMapFlushMode,
     version: atomic::AtomicU8,
     dirty: atomic::AtomicBool,
     dropped: atomic::AtomicBool,
@@ -51,7 +52,7 @@ impl std::fmt::Display for MemMap {
 
 impl MemMap {
     /// Create a memory mapping as [`MemMap`] for the given [`OsFile`]
-    pub(crate) fn map(file: &OsFile, len: usize) -> GraveResult<Self> {
+    pub(crate) fn map(file: &OsFile, len: usize, mode: MemMapFlushMode) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let mmap = ();
 
@@ -59,6 +60,7 @@ impl MemMap {
         let mmap = unsafe { linux::MMap::map(file.fd(), len) }?;
 
         let core = Arc::new(MapCore {
+            mode,
             cv: sync::Condvar::new(),
             lock: sync::Mutex::new(()),
             version: atomic::AtomicU8::new(0),
@@ -67,7 +69,10 @@ impl MemMap {
             mmap: cell::UnsafeCell::new(mem::ManuallyDrop::new(mmap)),
         });
 
-        Self::spawn_tx(core.clone());
+        if mode == MemMapFlushMode::Background {
+            Self::spawn_tx(core.clone());
+        }
+
         Ok(Self { core })
     }
 
@@ -199,6 +204,16 @@ impl Drop for MemMap {
 }
 
 //
+// Flush modes
+//
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MemMapFlushMode {
+    Background,
+    Immediate,
+}
+
+//
 // Reader
 //
 
@@ -247,8 +262,15 @@ impl<'a, T> MemMapWriter<'a, T> {
         );
 
         let res = unsafe { f(&mut *self.ptr) };
-        self.map.core.dirty.store(true, atomic::Ordering::Release);
-        self.map.core.cv.notify_one();
+        match self.map.core.mode {
+            MemMapFlushMode::Immediate => {
+                let _ = self.map.sync();
+            }
+            MemMapFlushMode::Background => {
+                self.map.core.dirty.store(true, atomic::Ordering::Release);
+                self.map.core.cv.notify_one();
+            }
+        }
 
         res
     }
@@ -262,6 +284,7 @@ mod tests {
     use tempfile::tempdir;
 
     const PAGE_SIZE: usize = 0x20;
+    const MODE: MemMapFlushMode = MemMapFlushMode::Immediate;
 
     fn tmp_file(len: usize) -> OsFile {
         let dir = tempdir().expect("tmp dir");
@@ -277,14 +300,14 @@ mod tests {
     fn map_unmap_cycle() {
         let file = tmp_file(PAGE_SIZE);
 
-        let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+        let mmap = MemMap::map(&file, PAGE_SIZE, MODE).expect("map");
         assert_eq!(mmap.len(), PAGE_SIZE);
     }
 
     #[test]
     fn sync_sanity() {
         let file = tmp_file(PAGE_SIZE);
-        let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+        let mmap = MemMap::map(&file, PAGE_SIZE, MODE).expect("map");
 
         assert!(mmap.sync().is_ok(), "sync failed");
     }
@@ -295,7 +318,7 @@ mod tests {
         #[test]
         fn write_read_cycle() {
             let file = tmp_file(PAGE_SIZE);
-            let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+            let mmap = MemMap::map(&file, PAGE_SIZE, MODE).expect("map");
 
             {
                 let w = mmap.writer::<u64>(0);
@@ -320,7 +343,7 @@ mod tests {
                 file.zero_extend(PAGE_SIZE).unwrap();
                 file.sync().expect("failed to sync");
 
-                let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+                let mmap = MemMap::map(&file, PAGE_SIZE, MODE).expect("map");
                 mmap.writer::<u64>(0).write(|v| *v = 0xAABBCCDDEEFF0011);
                 mmap.sync().expect("failed to sync");
             }
@@ -328,7 +351,7 @@ mod tests {
             // open_file + mmap + read
             {
                 let file = OsFile::open(&path).expect("open");
-                let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+                let mmap = MemMap::map(&file, PAGE_SIZE, MODE).expect("map");
 
                 let r = mmap.reader::<u64>(0);
                 assert_eq!(r.read(|val| *val), 0xAABBCCDDEEFF0011);
@@ -338,7 +361,7 @@ mod tests {
         #[test]
         fn mmap_and_pread_see_same_data() {
             let file = tmp_file(PAGE_SIZE);
-            let mmap = MemMap::map(&file, PAGE_SIZE).expect("map");
+            let mmap = MemMap::map(&file, PAGE_SIZE, MODE).expect("map");
 
             // write
             {
@@ -361,7 +384,7 @@ mod tests {
         #[test]
         fn write_read_cycle() {
             let file = tmp_file(PAGE_SIZE);
-            let mmap = Arc::new(MemMap::map(&file, PAGE_SIZE).expect("map"));
+            let mmap = Arc::new(MemMap::map(&file, PAGE_SIZE, MODE).expect("map"));
 
             mmap.writer::<u64>(0).write(|v| *v = 0x1122334455667788);
             mmap.sync().expect("failed to sync");
@@ -385,7 +408,7 @@ mod tests {
             const N: usize = 4;
 
             let file = tmp_file(PAGE_SIZE * N);
-            let mmap = Arc::new(MemMap::map(&file, PAGE_SIZE * N).expect("map"));
+            let mmap = Arc::new(MemMap::map(&file, PAGE_SIZE * N, MODE).expect("map"));
 
             let mut handles = Vec::new();
             for i in 0..N {

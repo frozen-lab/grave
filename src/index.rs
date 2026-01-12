@@ -1,7 +1,7 @@
 use crate::{
     file::OsFile,
     hints::unlikely,
-    mmap::{MemMap, MemMapReader},
+    mmap::{MemMap, MemMapFlushMode, MemMapReader},
     GraveConfig, GraveError, GraveResult,
 };
 use std::{cell::UnsafeCell, sync::RwLock};
@@ -56,7 +56,7 @@ impl Index {
         })?;
 
         // S2: MMap file & write new meta
-        let mmap = MemMap::map(&file, file_len).map_err(|e| {
+        let mmap = MemMap::map(&file, file_len, MemMapFlushMode::Background).map_err(|e| {
             // we clear up the created file, so new init call would process correctly!
             Self::clear_file(&file, &filepath);
             e
@@ -120,7 +120,7 @@ impl Index {
         }
 
         // S3: MMap file
-        let mmap = MemMap::map(&file, file_len)?;
+        let mmap = MemMap::map(&file, file_len, MemMapFlushMode::Background)?;
 
         // S4: Read & Validate Metadata
         let meta_reader = mmap.reader::<Metadata>(METADATA_OFF);
@@ -209,7 +209,7 @@ impl Index {
         mmap.unmap()?;
         self.file.zero_extend(new_len)?;
         self.file.sync()?;
-        *mmap = MemMap::map(&self.file, new_len)?;
+        *mmap = MemMap::map(&self.file, new_len, MemMapFlushMode::Background)?;
 
         // S3: update current & new tail
         let meta = mmap.reader::<Metadata>(METADATA_OFF);
