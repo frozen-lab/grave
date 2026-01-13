@@ -119,7 +119,7 @@ impl MMap {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use crate::file::OsFile;
+    use crate::{common::IOFlushMode, file::OsFile};
     use tempfile::tempdir;
 
     const PAGE: usize = 0x100;
@@ -129,7 +129,7 @@ mod tests {
         let path = dir.path().join(&format!("test_mmap_{len}"));
 
         unsafe {
-            let file = OsFile::new(&path).expect("new file");
+            let file = OsFile::new(&path, IOFlushMode::Manual).expect("new file");
             file.zero_extend(len).expect("set init len");
             file.sync().expect("flush to disk");
             file
@@ -221,7 +221,7 @@ mod tests {
 
             // new_file + mmap + write + sync
             unsafe {
-                let file = OsFile::new(&path).expect("new file");
+                let file = OsFile::new(&path, IOFlushMode::Manual).expect("new file");
                 file.zero_extend(PAGE).expect("set init len");
                 file.sync().expect("flush to disk");
 
@@ -236,7 +236,7 @@ mod tests {
 
             // open_file + mmap + read
             unsafe {
-                let file = OsFile::open(&path).expect("new file");
+                let file = OsFile::open(&path, IOFlushMode::Manual).expect("new file");
                 let map = unsafe { MMap::map(file.fd(), PAGE).expect("new map") };
 
                 let val = *map.get::<u64>(0);

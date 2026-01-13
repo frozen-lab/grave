@@ -1,16 +1,41 @@
-use crate::GraveResult;
+use crate::{
+    common::{likely, IOFlushMode},
+    GraveResult,
+};
+use std::{
+    cell, mem,
+    sync::{self, atomic, Arc},
+};
 
 #[cfg(target_os = "linux")]
 mod linux;
 
 #[derive(Debug)]
-pub(crate) struct OsFile {
+struct FileCore {
+    mode: IOFlushMode,
+    cv: sync::Condvar,
+    lock: sync::Mutex<()>,
+    version: atomic::AtomicU8,
+    dirty: atomic::AtomicBool,
+    closed: atomic::AtomicBool,
+
     #[cfg(target_os = "linux")]
-    file: linux::File,
+    file: cell::UnsafeCell<mem::ManuallyDrop<linux::File>>,
 
     #[cfg(not(target_os = "linux"))]
     file: (),
 }
+
+unsafe impl Send for FileCore {}
+unsafe impl Sync for FileCore {}
+
+#[derive(Debug)]
+pub(crate) struct OsFile {
+    core: Arc<FileCore>,
+}
+
+unsafe impl Send for OsFile {}
+unsafe impl Sync for OsFile {}
 
 impl std::fmt::Display for OsFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -18,7 +43,15 @@ impl std::fmt::Display for OsFile {
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        write!(f, "OsFile {{fd: {:?}}}", self.file.fd())
+        write!(
+            f,
+            "OsFile {{fd: {}, len: {:?}, version: {}, closed: {}, mode: {:?}}}",
+            unsafe { mem::ManuallyDrop::take(&mut *self.core.file.get()).fd() },
+            unsafe { mem::ManuallyDrop::take(&mut *self.core.file.get()).len() },
+            self.core.version.load(atomic::Ordering::Acquire),
+            self.core.closed.load(atomic::Ordering::Acquire),
+            self.core.mode,
+        )
     }
 }
 
@@ -29,14 +62,28 @@ impl OsFile {
     ///
     /// The file handle (`fd` on `Linux`), is tied to the [`OsFile`] itself, hence the
     /// underlying resource is automatically released when [`OsFile`] goes out of scope
-    pub(crate) fn new(path: &std::path::PathBuf) -> GraveResult<Self> {
+    pub(crate) fn new(path: &std::path::PathBuf, mode: IOFlushMode) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let file = ();
 
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::File::new(path) }?;
 
-        Ok(Self { file })
+        let core = Arc::new(FileCore {
+            mode: mode.clone(),
+            cv: sync::Condvar::new(),
+            lock: sync::Mutex::new(()),
+            version: atomic::AtomicU8::new(0),
+            dirty: atomic::AtomicBool::new(false),
+            closed: atomic::AtomicBool::new(false),
+            file: cell::UnsafeCell::new(mem::ManuallyDrop::new(file)),
+        });
+
+        if mode == IOFlushMode::Background {
+            Self::spawn_tx(core.clone());
+        }
+
+        Ok(Self { core })
     }
 
     /// Opens an existing [`OsFile`] at given `Path`
@@ -45,20 +92,34 @@ impl OsFile {
     ///
     /// The file handle (`fd` on `Linux`), is tied to the [`OsFile`] itself, hence the
     /// underlying resource is automatically released when [`OsFile`] goes out of scope    
-    pub(crate) fn open(path: &std::path::PathBuf) -> GraveResult<Self> {
+    pub(crate) fn open(path: &std::path::PathBuf, mode: IOFlushMode) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         let file = ();
 
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::File::open(path) }?;
 
-        Ok(Self { file })
+        let core = Arc::new(FileCore {
+            mode: mode.clone(),
+            cv: sync::Condvar::new(),
+            lock: sync::Mutex::new(()),
+            version: atomic::AtomicU8::new(0),
+            dirty: atomic::AtomicBool::new(false),
+            closed: atomic::AtomicBool::new(false),
+            file: cell::UnsafeCell::new(mem::ManuallyDrop::new(file)),
+        });
+
+        if mode == IOFlushMode::Background {
+            Self::spawn_tx(core.clone());
+        }
+
+        Ok(Self { core })
     }
 
     /// Fetches file handle for [`OsFile`] (**Linux Only**)
     #[cfg(target_os = "linux")]
     pub(crate) fn fd(&self) -> i32 {
-        self.file.fd()
+        unsafe { mem::ManuallyDrop::take(&mut *self.core.file.get()).fd() }
     }
 
     /// Close + Delete [`OsFile`] at given [`Path`]
@@ -68,9 +129,10 @@ impl OsFile {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            match self.file.close() {
+            let file = self.get_file();
+            match file.close() {
                 Err(e) => Err(e),
-                Ok(_) => self.file.unlink(path),
+                Ok(_) => file.unlink(path),
             }
         }
     }
@@ -82,7 +144,7 @@ impl OsFile {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.sync()
+            Self::sync_internal(&self.core)
         }
     }
 
@@ -96,7 +158,7 @@ impl OsFile {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.ftruncate(new_len)
+            self.get_file().ftruncate(new_len)
         }
     }
 
@@ -107,7 +169,7 @@ impl OsFile {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.len()
+            self.get_file().len()
         }
     }
 
@@ -124,7 +186,7 @@ impl OsFile {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.lock()?;
+            self.get_file().lock()?;
             Ok(OsFileLockGuard(self))
         }
     }
@@ -137,7 +199,7 @@ impl OsFile {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.pread(ptr, off, len)
+            self.get_file().pread(ptr, off, len)
         }
     }
 
@@ -148,9 +210,14 @@ impl OsFile {
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        unsafe {
-            self.file.pwrite(ptr, off, page_size)
+        let res = unsafe { self.get_file().pwrite(ptr, off, page_size) };
+
+        if likely(res.is_ok() && self.core.mode == IOFlushMode::Background) {
+            self.core.dirty.store(true, atomic::Ordering::Release);
+            self.core.cv.notify_one();
         }
+
+        res
     }
 
     /// Performs **multi page** blocking write to [`OsFile`]
@@ -160,9 +227,23 @@ impl OsFile {
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        unsafe {
-            self.file.pwritev(ptr, off, page_size)
+        let res = unsafe { self.get_file().pwritev(ptr, off, page_size) };
+
+        match self.core.mode {
+            IOFlushMode::Background => {
+                self.core.dirty.store(true, atomic::Ordering::Release);
+                self.core.cv.notify_one();
+            }
+            _ => {}
         }
+
+        res
+    }
+
+    #[cfg(target_os = "linux")]
+    #[inline]
+    fn get_file(&self) -> linux::File {
+        unsafe { mem::ManuallyDrop::take(&mut *self.core.file.get()) }
     }
 
     fn unlock(&self) -> GraveResult<()> {
@@ -171,7 +252,7 @@ impl OsFile {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.unlock()
+            self.get_file().unlock()
         }
     }
 
@@ -181,16 +262,72 @@ impl OsFile {
 
         #[cfg(target_os = "linux")]
         unsafe {
-            self.file.close()
+            self.get_file().close()
         }
+    }
+
+    #[inline]
+    fn sync_internal(core: &FileCore) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            (&*core.file.get()).sync()
+        }
+    }
+
+    fn spawn_tx(core: Arc<FileCore>) {
+        std::thread::spawn(move || unsafe {
+            let mut guard = match core.lock.lock() {
+                Ok(ret) => ret,
+                Err(err) => {
+                    eprint!("ERROR: OsFile tx: {err}");
+                    return;
+                }
+            };
+
+            loop {
+                if core.closed.load(atomic::Ordering::Acquire) {
+                    break;
+                }
+
+                guard = match core.cv.wait_timeout(guard, std::time::Duration::from_secs(1)) {
+                    Ok((g, _)) => g,
+                    Err(e) => {
+                        eprintln!("OsFile tx condvar poisoned: {e}");
+                        return;
+                    }
+                };
+
+                if core.dirty.swap(false, atomic::Ordering::AcqRel) {
+                    // release lock before I/O
+                    drop(guard);
+
+                    unsafe {
+                        let _ = (&*core.file.get()).sync();
+                    }
+
+                    // require for next loop
+                    guard = match core.lock.lock() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            eprintln!("OsFile tx mutex poisoned: {e}");
+                            return;
+                        }
+                    };
+                }
+            }
+        });
     }
 }
 
-unsafe impl Send for OsFile {}
-unsafe impl Sync for OsFile {}
-
 impl Drop for OsFile {
     fn drop(&mut self) {
+        self.core.closed.store(true, atomic::Ordering::Release);
+        self.core.cv.notify_one();
+
+        let _ = Self::sync_internal(&self.core);
         let _ = self.close();
     }
 }
@@ -220,7 +357,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("tmp_file");
 
-        let file = OsFile::new(&path).expect("create new file");
+        let file = OsFile::new(&path, IOFlushMode::Manual).expect("create new file");
         assert_eq!(file.len().expect("read file len"), 0);
 
         assert!(file.close().is_ok(), "failed to close file");
@@ -233,11 +370,11 @@ mod tests {
         let path = dir.path().join("tmp_file");
 
         {
-            let file = OsFile::new(&path).expect("create new file");
+            let file = OsFile::new(&path, IOFlushMode::Manual).expect("create new file");
             assert!(file.close().is_ok(), "failed to close file");
         }
 
-        let file = OsFile::open(&path).expect("open existing file");
+        let file = OsFile::open(&path, IOFlushMode::Manual).expect("open existing file");
         assert_eq!(file.len().expect("read file len"), 0);
 
         assert!(file.close().is_ok(), "failed to close file");
@@ -248,7 +385,10 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("missing_file");
 
-        assert!(OsFile::open(&path).is_err(), "open must fail for missing file");
+        assert!(
+            OsFile::open(&path, IOFlushMode::Manual).is_err(),
+            "open must fail for missing file"
+        );
     }
 
     #[test]
@@ -256,7 +396,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("tmp_file");
 
-        let file = OsFile::new(&path).expect("create new file");
+        let file = OsFile::new(&path, IOFlushMode::Manual).expect("create new file");
         assert!(file.zero_extend(PAGE_SIZE * 2).is_ok(), "zero_extend failed");
         assert!(file.sync().is_ok(), "fdatasync failed");
 
@@ -271,7 +411,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("tmp_file");
 
-        let file = OsFile::new(&path).expect("create new file");
+        let file = OsFile::new(&path, IOFlushMode::Manual).expect("create new file");
         assert!(file.close().is_ok(), "failed to close file");
         assert!(file.close().is_err(), "close must fail after close");
     }
@@ -282,7 +422,7 @@ mod tests {
         let tmp = dir.path().join("tmp_file");
 
         unsafe {
-            let file = OsFile::new(&tmp).expect("open existing file");
+            let file = OsFile::new(&tmp, IOFlushMode::Manual).expect("open existing file");
 
             // close + unlink
             assert!(file.delete(&tmp).is_ok(), "failed to unlink the file");
@@ -304,7 +444,7 @@ mod tests {
             let tmp = dir.path().join("tmp_file");
 
             unsafe {
-                let file = OsFile::new(&tmp).expect("open existing file");
+                let file = OsFile::new(&tmp, IOFlushMode::Manual).expect("open existing file");
 
                 // write
                 assert!(file.write(DATA.as_ptr(), 0, PAGE_SIZE).is_ok(), "pwrite failed");
@@ -333,7 +473,7 @@ mod tests {
 
             // create + write + sync + close
             unsafe {
-                let file = OsFile::new(&tmp).expect("open existing file");
+                let file = OsFile::new(&tmp, IOFlushMode::Manual).expect("open existing file");
 
                 assert!(file.write(DATA.as_ptr(), 0, PAGE_SIZE).is_ok(), "pwrite failed");
                 assert!(file.sync().is_ok(), "fdatasync failed");
@@ -343,7 +483,7 @@ mod tests {
 
             // open + read + close
             unsafe {
-                let file = OsFile::open(&tmp).expect("open existing file");
+                let file = OsFile::open(&tmp, IOFlushMode::Manual).expect("open existing file");
 
                 // len validation
                 let len = file.len().expect("read len for file");
@@ -374,7 +514,7 @@ mod tests {
             let total_len = ptrs.len() * PAGE_SIZE;
 
             unsafe {
-                let file = OsFile::new(&tmp).expect("open existing file");
+                let file = OsFile::new(&tmp, IOFlushMode::Manual).expect("open existing file");
 
                 // write
                 assert!(file.writev(&ptrs, 0, PAGE_SIZE).is_ok(), "pwritev failed");
@@ -409,7 +549,7 @@ mod tests {
 
             // create + write + sync + close
             unsafe {
-                let file = OsFile::new(&tmp).expect("open existing file");
+                let file = OsFile::new(&tmp, IOFlushMode::Manual).expect("open existing file");
 
                 assert!(file.writev(&ptrs, 0, PAGE_SIZE).is_ok(), "pwritev failed");
                 assert!(file.sync().is_ok(), "fdatasync failed");
@@ -419,7 +559,7 @@ mod tests {
 
             // open + read + close
             unsafe {
-                let file = OsFile::open(&tmp).expect("open existing file");
+                let file = OsFile::open(&tmp, IOFlushMode::Manual).expect("open existing file");
 
                 // len validation
                 let len = file.len().expect("read len for file");
@@ -451,7 +591,7 @@ mod tests {
 
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("tmp_file");
-            let file = Arc::new(OsFile::new(&path).expect("create new file"));
+            let file = Arc::new(OsFile::new(&path, IOFlushMode::Manual).expect("create new file"));
 
             let mut handles = Vec::with_capacity(NTHREADS);
             for i in 0..NTHREADS {
@@ -498,7 +638,7 @@ mod tests {
 
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("tmp_file");
-            let file = Arc::new(OsFile::new(&path).expect("create new file"));
+            let file = Arc::new(OsFile::new(&path, IOFlushMode::Manual).expect("create new file"));
 
             let data = vec![0xABu8; PAGE_SIZE];
             assert!(file.write(data.as_ptr(), 0, PAGE_SIZE).is_ok(), "initial write failed");
@@ -531,7 +671,7 @@ mod tests {
 
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("tmp_file");
-            let file = Arc::new(OsFile::new(&path).expect("create new file"));
+            let file = Arc::new(OsFile::new(&path, IOFlushMode::Manual).expect("create new file"));
 
             let pages: Vec<Vec<u8>> = (0..NPAGES).map(|i| vec![i as u8; PAGE_SIZE]).collect();
             let ptrs: Vec<*const u8> = pages.iter().map(|p| p.as_ptr()).collect();
@@ -571,7 +711,7 @@ mod tests {
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("lock_file");
 
-            let file = OsFile::new(&path).expect("create file");
+            let file = OsFile::new(&path, IOFlushMode::Manual).expect("create file");
 
             assert!(file.lock().is_ok());
             assert!(file.unlock().is_ok());
@@ -589,8 +729,8 @@ mod tests {
 
             static ENTERED: AtomicBool = AtomicBool::new(false);
 
-            let f1 = OsFile::new(&path).expect("create file");
-            let f2 = OsFile::open(&path).expect("open file");
+            let f1 = OsFile::new(&path, IOFlushMode::Manual).expect("create file");
+            let f2 = OsFile::open(&path, IOFlushMode::Manual).expect("open file");
 
             assert!(f1.lock().is_ok());
 
@@ -616,7 +756,7 @@ mod tests {
             let dir = tempdir().expect("temp dir");
             let path = dir.path().join("lock_file");
 
-            let file = OsFile::new(&path).expect("create file");
+            let file = OsFile::new(&path, IOFlushMode::Manual).expect("create file");
 
             assert!(file.lock().is_ok());
 

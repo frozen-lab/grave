@@ -47,7 +47,7 @@ impl Index {
         let file_len = METADATA_SIZE + (num_block * BLOCK_SIZE);
 
         // S1: New file (creation + prep)
-        let file = OsFile::new(&filepath)?;
+        let file = OsFile::new(&filepath, IOFlushMode::Manual)?;
         file.zero_extend(file_len).map_err(|e| {
             // as `zero_extend` operation is not atomic, we clear up the created file,
             // so new init call would process correctly!
@@ -109,7 +109,7 @@ impl Index {
         debug_assert!(filepath.is_file());
 
         // S1: Open existing file
-        let file = OsFile::new(&filepath)?;
+        let file = OsFile::new(&filepath, IOFlushMode::Manual)?;
 
         // S2: Read and validate len
         let file_len = file.len()?;

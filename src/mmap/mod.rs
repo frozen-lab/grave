@@ -171,22 +171,44 @@ impl MemMap {
 
     fn spawn_tx(core: Arc<MapCore>) {
         std::thread::spawn(move || unsafe {
-            let mut guard = core.lock.lock().expect("mutex poisoned");
-
-            while !core.dropped.load(atomic::Ordering::Acquire) {
-                let (g, _) = core
-                    .cv
-                    .wait_timeout(guard, std::time::Duration::from_secs(1))
-                    .expect("condvar poisoned");
-                guard = g;
-            }
-
-            if core.dirty.swap(false, atomic::Ordering::AcqRel) {
-                drop(guard);
-                unsafe {
-                    let _ = (&*core.mmap.get()).sync();
+            let mut guard = match core.lock.lock() {
+                Ok(ret) => ret,
+                Err(err) => {
+                    eprint!("ERROR: OsFile tx: {err}");
+                    return;
                 }
-                guard = core.lock.lock().expect("mutex poisoned");
+            };
+
+            loop {
+                if core.dropped.load(atomic::Ordering::Acquire) {
+                    break;
+                }
+
+                guard = match core.cv.wait_timeout(guard, std::time::Duration::from_secs(1)) {
+                    Ok((g, _)) => g,
+                    Err(e) => {
+                        eprintln!("OsFile tx condvar poisoned: {e}");
+                        return;
+                    }
+                };
+
+                if core.dirty.swap(false, atomic::Ordering::AcqRel) {
+                    // release lock before I/O
+                    drop(guard);
+
+                    unsafe {
+                        let _ = (&*core.mmap.get()).sync();
+                    }
+
+                    // require for next loop
+                    guard = match core.lock.lock() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            eprintln!("OsFile tx mutex poisoned: {e}");
+                            return;
+                        }
+                    };
+                }
             }
         });
     }
@@ -254,7 +276,7 @@ impl<'a, T> MemMapWriter<'a, T> {
 
         let res = unsafe { f(&mut *self.ptr) };
         match self.map.core.mode {
-            IOFlushMode::Immediate => {
+            IOFlushMode::Manual => {
                 let _ = self.map.sync();
             }
             IOFlushMode::Background => {
@@ -275,13 +297,13 @@ mod tests {
     use tempfile::tempdir;
 
     const PAGE_SIZE: usize = 0x20;
-    const MODE: IOFlushMode = IOFlushMode::Immediate;
+    const MODE: IOFlushMode = IOFlushMode::Manual;
 
     fn tmp_file(len: usize) -> OsFile {
         let dir = tempdir().expect("tmp dir");
         let path = dir.path().join("tmp_memmap");
 
-        let file = OsFile::new(&path).expect("new file");
+        let file = OsFile::new(&path, IOFlushMode::Manual).expect("new file");
         file.zero_extend(len).expect("zero extend");
         file.sync().expect("sync");
         file
@@ -330,7 +352,7 @@ mod tests {
 
             // create_file + mmap + write + sync
             {
-                let file = OsFile::new(&path).expect("new");
+                let file = OsFile::new(&path, IOFlushMode::Manual).expect("new");
                 file.zero_extend(PAGE_SIZE).unwrap();
                 file.sync().expect("failed to sync");
 
@@ -341,7 +363,7 @@ mod tests {
 
             // open_file + mmap + read
             {
-                let file = OsFile::open(&path).expect("open");
+                let file = OsFile::open(&path, IOFlushMode::Manual).expect("open");
                 let mmap = MemMap::map(&file, PAGE_SIZE, MODE).expect("map");
 
                 let r = mmap.reader::<u64>(0);

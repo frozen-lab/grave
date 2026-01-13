@@ -40,5 +40,5 @@ fn test_sanity_of_unlikely_hint() {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum IOFlushMode {
     Background,
-    Immediate,
+    Manual,
 }
