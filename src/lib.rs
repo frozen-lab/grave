@@ -9,6 +9,9 @@ mod errors;
 mod mmap;
 
 #[allow(unused)]
+mod coffin;
+
+#[allow(unused)]
 mod pool;
 
 #[allow(unused)]
@@ -19,6 +22,8 @@ mod index;
 
 pub use cfg::{GraveConfig, GraveConfigValue};
 pub use errors::{GraveError, GraveResult};
+use index::{Index, TGraveOff};
+use pool::BufPool;
 
 /// A page based storage engine with fire-and-forget writes and crash-safe durability semantics
 ///
@@ -32,6 +37,8 @@ pub use errors::{GraveError, GraveResult};
 /// ```
 #[allow(unused)]
 pub struct Grave {
+    index: Index,
+    pool: BufPool,
     cfg: GraveConfig,
     dirpath: std::path::PathBuf,
 }
@@ -45,13 +52,44 @@ impl Grave {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
+        let is_new = dirpath.as_ref().exists();
+
         #[cfg(target_os = "linux")]
         Self::prep_directory(dirpath.as_ref())?;
 
+        let index = if is_new {
+            Index::new(dirpath.as_ref(), &cfg)
+        } else {
+            Index::open(dirpath.as_ref())
+        }?;
+
+        let pool = BufPool::new(cfg.num_block as u32, cfg.page_size as usize);
+
         Ok(Self {
             cfg,
+            pool,
+            index,
             dirpath: dirpath.as_ref().clone(),
         })
+    }
+
+    ///
+    pub fn write(&self, _data: &[u8]) -> GraveResult<TGraveOff> {
+        let off = self.index.alloc_single_slot()?;
+        let _slot = (off.slot_idx as usize) * (off.block_idx as usize);
+        let _ptr = self.pool.alloc().unwrap().ptr();
+
+        Ok(0)
+    }
+
+    ///
+    pub fn read(&self, _off: TGraveOff) -> GraveResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    ///
+    pub fn del(&self, _off: TGraveOff) -> GraveResult<()> {
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

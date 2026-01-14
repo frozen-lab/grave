@@ -285,7 +285,7 @@ impl PoolSlot {
     }
 
     #[inline]
-    const fn ptr(&self) -> SLOT {
+    pub(crate) const fn ptr(&self) -> SLOT {
         self.0
     }
 }

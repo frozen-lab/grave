@@ -37,7 +37,7 @@ const _: () = assert!(DEFAULT_MEM_POOL_CAP.to_u32() >= 8, "MEM_POOL_CAP must be 
 ///   memory_pool_capacity: GraveConfigValue::N128,
 /// };
 /// ```
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub struct GraveConfig {
     /// Controls the **number of in-memory pages** available to use for write operations
     ///
@@ -236,7 +236,7 @@ impl Default for GraveConfig {
 ///   memory_pool_capacity: GraveConfigValue::N128,
 /// };
 /// ```
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum GraveConfigValue {
     /// 8 units/bytes
     N8,

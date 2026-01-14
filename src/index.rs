@@ -145,7 +145,7 @@ impl Index {
     }
 
     #[inline]
-    pub(crate) fn alloc_single_slot(&self) -> GraveResult<TGraveOff> {
+    pub(crate) fn alloc_single_slot(&self) -> GraveResult<GraveOff> {
         loop {
             // PHASE 1: scan existing bitmap chain
             {
@@ -171,7 +171,7 @@ impl Index {
                             slot_idx,
                             num_slots: 1,
                         };
-                        return Ok(off.encode());
+                        return Ok(off);
                     }
 
                     // walk bitmap chain
@@ -549,10 +549,10 @@ pub(crate) type TGraveOff = u64;
 
 #[derive(Debug)]
 pub(crate) struct GraveOff {
-    flag: u8, // 0 or 1
-    block_idx: u32,
-    slot_idx: u16,
-    num_slots: u32,
+    pub(crate) flag: u8, // 0 or 1
+    pub(crate) block_idx: u32,
+    pub(crate) slot_idx: u16,
+    pub(crate) num_slots: u32,
 }
 
 impl GraveOff {
@@ -771,7 +771,7 @@ mod tests {
                 let idx = Index::new(&dir, &cfg).expect("new Index");
 
                 let off = idx.alloc_single_slot().expect("alloc single");
-                assert!(idx.free_single_slot(off).is_ok());
+                assert!(idx.free_single_slot(off.encode()).is_ok());
             }
 
             #[test]
@@ -804,7 +804,7 @@ mod tests {
                 }
 
                 for off in offs {
-                    idx.free_single_slot(off).unwrap();
+                    idx.free_single_slot(off.encode()).unwrap();
                 }
 
                 // should fully reuse
