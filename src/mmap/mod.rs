@@ -77,30 +77,30 @@ impl MemMap {
         Ok(Self { core })
     }
 
-    /// Unmap the mapped memory for [`MemMap`]
-    ///
-    /// ## Safety
-    ///
-    /// `unmap` is idempotent, hence calling it multiple times would not result into
-    /// any errors or UB
-    pub(crate) fn unmap(&mut self) -> GraveResult<()> {
-        // sanity protection to avoid unmap after unmap
-        if self.core.dropped.load(atomic::Ordering::Acquire) {
-            return Ok(());
-        }
+    // /// Unmap the mapped memory for [`MemMap`]
+    // ///
+    // /// ## Safety
+    // ///
+    // /// `unmap` is idempotent, hence calling it multiple times would not result into
+    // /// any errors or UB
+    // pub(crate) fn unmap(&mut self) -> GraveResult<()> {
+    //     // sanity protection to avoid unmap after unmap
+    //     if self.core.dropped.load(atomic::Ordering::Acquire) {
+    //         return Ok(());
+    //     }
 
-        #[cfg(not(target_os = "linux"))]
-        unimplemented!();
+    //     #[cfg(not(target_os = "linux"))]
+    //     unimplemented!();
 
-        #[cfg(target_os = "linux")]
-        unsafe {
-            mem::ManuallyDrop::take(&mut *self.core.mmap.get()).unmap()?;
-        }
+    //     #[cfg(target_os = "linux")]
+    //     unsafe {
+    //         mem::ManuallyDrop::take(&mut *self.core.mmap.get()).unmap()?;
+    //     }
 
-        self.core.version.fetch_add(1, atomic::Ordering::Release);
-        self.core.dropped.store(true, atomic::Ordering::Release);
-        Ok(())
-    }
+    //     self.core.version.fetch_add(1, atomic::Ordering::Release);
+    //     self.core.dropped.store(true, atomic::Ordering::Release);
+    //     Ok(())
+    // }
 
     /// Fetches current length of [`MemMap`]
     #[inline]

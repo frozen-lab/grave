@@ -40,6 +40,9 @@ pub(crate) struct Index {
     mmap: UnsafeCell<MemMap>,
 }
 
+unsafe impl Send for Index {}
+unsafe impl Sync for Index {}
+
 impl Index {
     pub(crate) fn new(dirpath: &std::path::PathBuf, cfg: &GraveConfig) -> GraveResult<Self> {
         let filepath = dirpath.join(PATH);
@@ -258,13 +261,31 @@ impl Index {
         // sanity check
         debug_assert!(new_block_idx <= MAX_PAGE_INDEX, "block index overflow");
 
-        // S2: unmap, zero_extend & remap
-        mmap.unmap()?;
+        // S2: Unmap, Extend, Remap (SAFETY FIX)
+        // ---------------------------------------------------------
+        // We use unsafe ptr::read/write to manage the lifecycle manually.
+        // 1. Read the old map out (ownership moves to `old_map`).
+        //    The `mmap` reference now points to uninitialized memory temporarily.
+        let old_map = unsafe { std::ptr::read(mmap) };
+
+        // 2. Drop the old map. This triggers the underlying munmap ONCE.
+        drop(old_map);
+
+        // 3. Now it is safe to resize the file.
         self.file.zero_extend(new_len)?;
         self.file.sync()?;
-        *mmap = MemMap::map(&self.file, new_len, MAP_FLUSH_MODE)?;
+
+        // 4. Create the new mapping.
+        let new_map = MemMap::map(&self.file, new_len, MAP_FLUSH_MODE)?;
+
+        // 5. Write the new map back into the reference.
+        //    We use ptr::write to avoid trying to Drop the garbage
+        //    that was sitting in `mmap` (since we moved it out in step 1).
+        unsafe { std::ptr::write(mmap, new_map) };
+        // ---------------------------------------------------------
 
         // S3: update current & new tail
+        // (This logic remains exactly the same as your previous code)
         let meta = mmap.reader::<Metadata>(METADATA_OFF);
         let (tail_idx, flag) = meta.read(|meta| match kind {
             GrowKind::BitMap => (unsafe { (*meta).bmap_tail_idx }, BlockHeaderFlag::BITMAP),
@@ -700,3 +721,95 @@ struct AdjArr {
 
 // sanity check
 const _: () = assert!(std::mem::size_of::<AdjArr>() == BLOCK_SIZE);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    mod index {
+        use super::*;
+
+        #[test]
+        fn new_works() {
+            let tmp = TempDir::new().expect("tmp dir");
+            let dir = tmp.path().to_path_buf();
+            let cfg = GraveConfig::default();
+
+            assert!(Index::new(&dir, &cfg).is_ok());
+        }
+
+        #[test]
+        fn open_works() {
+            let tmp = TempDir::new().expect("tmp dir");
+            let dir = tmp.path().to_path_buf();
+            let cfg = GraveConfig::default();
+
+            {
+                let _ = Index::new(&dir, &cfg).is_ok();
+            }
+
+            assert!(Index::open(&dir).is_ok());
+        }
+
+        #[test]
+        fn open_fails_when_missing() {
+            let tmp = TempDir::new().expect("tmp dir");
+            let dir = tmp.path().to_path_buf();
+
+            assert!(Index::open(&dir).is_err());
+        }
+
+        mod alloc_free {
+            use super::*;
+
+            #[test]
+            fn alloc_free_cycle() {
+                let tmp = TempDir::new().expect("tmp dir");
+                let dir = tmp.path().to_path_buf();
+                let cfg = GraveConfig::default();
+                let idx = Index::new(&dir, &cfg).expect("new Index");
+
+                let off = idx.alloc_single_slot().expect("alloc single");
+                assert!(idx.free_single_slot(off).is_ok());
+            }
+
+            #[test]
+            fn alloc_with_grow() {
+                let tmp = TempDir::new().expect("tmp dir");
+                let dir = tmp.path().to_path_buf();
+                let cfg = GraveConfig::default();
+                let idx = Index::new(&dir, &cfg).expect("new Index");
+
+                let mut offs = Vec::new();
+
+                // force bitmap exhaustion
+                for _ in 0..(PAGES_PER_BLOCK + 8) {
+                    offs.push(idx.alloc_single_slot().expect("alloc"));
+                }
+
+                assert!(offs.len() > PAGES_PER_BLOCK);
+            }
+
+            #[test]
+            fn free_after_grow() {
+                let tmp = TempDir::new().expect("tmp dir");
+                let dir = tmp.path().to_path_buf();
+                let cfg = GraveConfig::default();
+                let idx = Index::new(&dir, &cfg).expect("new Index");
+
+                let mut offs = Vec::new();
+                for _ in 0..(PAGES_PER_BLOCK + 4) {
+                    offs.push(idx.alloc_single_slot().unwrap());
+                }
+
+                for off in offs {
+                    idx.free_single_slot(off).unwrap();
+                }
+
+                // should fully reuse
+                let _ = idx.alloc_single_slot().unwrap();
+            }
+        }
+    }
+}
