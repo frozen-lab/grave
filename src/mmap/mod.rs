@@ -104,6 +104,7 @@ impl MemMap {
 
     /// Fetches current length of [`MemMap`]
     #[inline]
+    #[allow(unused)]
     pub(crate) fn len(&self) -> usize {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
@@ -170,7 +171,7 @@ impl MemMap {
     }
 
     fn spawn_tx(core: Arc<MapCore>) {
-        std::thread::spawn(move || unsafe {
+        std::thread::spawn(move || {
             let mut guard = match core.lock.lock() {
                 Ok(ret) => ret,
                 Err(err) => {

@@ -127,13 +127,11 @@ mod tests {
     fn tmp_file(len: usize) -> OsFile {
         let dir = tempdir().expect("tmp dir");
         let path = dir.path().join(&format!("test_mmap_{len}"));
+        let file = OsFile::new(&path, IOFlushMode::Manual).expect("new file");
 
-        unsafe {
-            let file = OsFile::new(&path, IOFlushMode::Manual).expect("new file");
-            file.zero_extend(len).expect("set init len");
-            file.sync().expect("flush to disk");
-            file
-        }
+        file.zero_extend(len).expect("set init len");
+        file.sync().expect("flush to disk");
+        file
     }
 
     #[test]
@@ -152,7 +150,6 @@ mod tests {
 
     #[test]
     fn map_fails_on_invalid_fd() {
-        let file = tmp_file(PAGE);
         unsafe {
             assert!(MMap::map(-1, PAGE).is_err());
         }
@@ -225,24 +222,23 @@ mod tests {
                 file.zero_extend(PAGE).expect("set init len");
                 file.sync().expect("flush to disk");
 
-                let map = unsafe { MMap::map(file.fd(), PAGE).expect("new map") };
+                let map = MMap::map(file.fd(), PAGE).expect("new map");
                 let ptr = map.get_mut::<u64>(0);
 
                 *ptr = 0xDEAD_C0DE_DEAD_C0DE;
                 map.sync().expect("sync failed");
 
-                unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
+                assert!(map.unmap().is_ok(), "failed to unmap");
             }
 
             // open_file + mmap + read
             unsafe {
                 let file = OsFile::open(&path, IOFlushMode::Manual).expect("new file");
-                let map = unsafe { MMap::map(file.fd(), PAGE).expect("new map") };
-
+                let map = MMap::map(file.fd(), PAGE).expect("new map");
                 let val = *map.get::<u64>(0);
                 assert_eq!(val, 0xDEAD_C0DE_DEAD_C0DE);
 
-                unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
+                assert!(map.unmap().is_ok(), "failed to unmap");
             }
         }
 
@@ -259,11 +255,9 @@ mod tests {
             }
 
             // pread
-            unsafe {
-                let mut buf = [0u8; 8];
-                file.read(buf.as_mut_ptr(), 0, 8).expect("failed to read");
-                assert_eq!(u64::from_le_bytes(buf), 0xDEAD_C0DE_DEAD_C0DE);
-            }
+            let mut buf = [0u8; 8];
+            file.read(buf.as_mut_ptr(), 0, 8).expect("failed to read");
+            assert_eq!(u64::from_le_bytes(buf), 0xDEAD_C0DE_DEAD_C0DE);
 
             unsafe { assert!(map.unmap().is_ok(), "failed to unmap") };
         }

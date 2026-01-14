@@ -4,19 +4,15 @@
 #![doc = include_str!("../README.md")]
 
 mod cfg;
+mod common;
 mod errors;
+mod mmap;
 
 #[allow(unused)]
 mod pool;
 
 #[allow(unused)]
-mod common;
-
-#[allow(unused)]
 mod file;
-
-#[allow(unused)]
-mod mmap;
 
 #[allow(unused)]
 mod index;

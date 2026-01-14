@@ -1,5 +1,5 @@
 use crate::{
-    common::{unlikely, IOFlushMode},
+    common,
     file::OsFile,
     mmap::{MemMap, MemMapReader},
     GraveConfig, GraveError, GraveResult,
@@ -10,6 +10,9 @@ const VERSION: u32 = 0;
 const MAGIC: [u8; 4] = *b"indx";
 const PATH: &'static str = "index";
 
+const MAP_FLUSH_MODE: common::IOFlushMode = common::IOFlushMode::Background;
+const FILE_FLUSH_MODE: common::IOFlushMode = common::IOFlushMode::Manual;
+
 // NOTE: When this values are updated, all the docs must be updated accordingly
 // for [`GraveConfig`], w/ corrected calculations for Memory and Disk overheads.
 
@@ -17,9 +20,13 @@ const BLOCK_SIZE: usize = 0x200;
 const MIN_BLOCKS_ON_INIT: usize = 2;
 const DEFAULT_BITMAP_IDX: usize = 0;
 const DEFAULT_ADJARR_IDX: usize = 1;
-const MAX_PAGE_INDEX: u32 = 0x07FF_FFFF;
 const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
 const PAGES_PER_BLOCK: usize = (BLOCK_SIZE - BLOCK_HEADER_SIZE) * 8;
+
+const MAX_CURRNET_PTR: u8 = 0xFF; // 8 bits  (0..=255)
+const MAX_FREE_PER_BLOCK: u16 = 0x0FFF; // 12 bits (0..=4095)
+const MAX_NUM_SLOTS: u32 = 0x00FF_FFFF; // 24 bits (0..=16,777,215)
+const MAX_PAGE_INDEX: u32 = 0x07FF_FFFF; // 27 bits (0..=134,217,727)
 
 // sanity checks
 const _: () = assert!(BLOCK_HEADER_SIZE == std::mem::size_of::<BlockHeader>());
@@ -47,7 +54,7 @@ impl Index {
         let file_len = METADATA_SIZE + (num_block * BLOCK_SIZE);
 
         // S1: New file (creation + prep)
-        let file = OsFile::new(&filepath, IOFlushMode::Manual)?;
+        let file = OsFile::new(&filepath, FILE_FLUSH_MODE)?;
         file.zero_extend(file_len).map_err(|e| {
             // as `zero_extend` operation is not atomic, we clear up the created file,
             // so new init call would process correctly!
@@ -56,7 +63,7 @@ impl Index {
         })?;
 
         // S2: MMap file & write new meta
-        let mmap = MemMap::map(&file, file_len, IOFlushMode::Background).map_err(|e| {
+        let mmap = MemMap::map(&file, file_len, MAP_FLUSH_MODE).map_err(|e| {
             // we clear up the created file, so new init call would process correctly!
             Self::clear_file(&file, &filepath);
             e
@@ -104,12 +111,8 @@ impl Index {
     pub(crate) fn open(dirpath: &std::path::PathBuf) -> GraveResult<Self> {
         let filepath = dirpath.join(PATH);
 
-        // sanity checks
-        debug_assert!(filepath.exists());
-        debug_assert!(filepath.is_file());
-
         // S1: Open existing file
-        let file = OsFile::new(&filepath, IOFlushMode::Manual)?;
+        let file = OsFile::open(&filepath, FILE_FLUSH_MODE)?;
 
         // S2: Read and validate len
         let file_len = file.len()?;
@@ -120,7 +123,7 @@ impl Index {
         }
 
         // S3: MMap file
-        let mmap = MemMap::map(&file, file_len, IOFlushMode::Background)?;
+        let mmap = MemMap::map(&file, file_len, MAP_FLUSH_MODE)?;
 
         // S4: Read & Validate Metadata
         let meta_reader = mmap.reader::<Metadata>(METADATA_OFF);
@@ -138,25 +141,70 @@ impl Index {
         })
     }
 
-    /// **NOTE:** dummy impl
     #[inline]
-    pub(crate) fn alloc_single_slot(&self) {
-        let block_idx = self.meta_read(|a| a.bmap_tail_idx);
-        let writer = unsafe { (*self.mmap.get()).writer::<BitMap>(METADATA_SIZE + (block_idx as usize * BLOCK_SIZE)) };
-        let _slot_idx = writer.write(|bmap| bmap.alloc_single());
+    pub(crate) fn alloc_single_slot(&self) -> GraveResult<TGraveOff> {
+        loop {
+            // PHASE 1: scan existing bitmap chain
+            {
+                let _r = self.lock.read()?;
+
+                // FIX: Start from the beginning (Head), not the Tail.
+                // This ensures we fill holes and traverse the linked list correctly
+                // to reach the new block added by grow().
+                let mut block_idx = DEFAULT_BITMAP_IDX as u32;
+
+                loop {
+                    let off = METADATA_SIZE + block_idx as usize * BLOCK_SIZE;
+
+                    // We need to be careful not to read OOB if the file was just grown
+                    // and we are chasing pointers faster than the mmap view updates,
+                    // but the lock protects us here.
+                    let writer = unsafe { (*self.mmap.get()).writer::<BitMap>(off) };
+
+                    if let Some(slot_idx) = writer.write(|b| b.alloc_single()) {
+                        let off = GraveOff {
+                            flag: 0,
+                            block_idx,
+                            slot_idx,
+                            num_slots: 1,
+                        };
+                        return Ok(off.encode());
+                    }
+
+                    // walk bitmap chain
+                    let next = unsafe { (*self.mmap.get()).reader::<BlockHeader>(off).read(|h| h.get_nidx()) };
+
+                    if next == 0 {
+                        break; // exhausted all bitmap blocks
+                    }
+
+                    block_idx = next;
+                }
+            }
+
+            // PHASE 2: no space anywhere -> grow & retry
+            self.grow(GrowKind::BitMap)?;
+        }
     }
 
-    /// **NOTE:** dummy impl
     #[inline]
-    pub(crate) fn free_single_slot(&self, slot: usize) {
-        let block_idx = 2; // calculate based on the slot
-        let writer = unsafe { (*self.mmap.get()).writer::<BitMap>(METADATA_SIZE + (block_idx as usize * BLOCK_SIZE)) };
-        let _slot_idx = writer.write(|bmap| bmap.free_single(slot as u16));
-    }
-
-    fn is_tail_block_full(&self, kind: GrowKind) -> GraveResult<bool> {
+    pub(crate) fn free_single_slot(&self, off: TGraveOff) -> GraveResult<()> {
+        // allow parallel frees
         let _r = self.lock.read()?;
 
+        let grave_off = GraveOff::decode(off);
+        let block_off = METADATA_SIZE + grave_off.block_idx as usize * BLOCK_SIZE;
+
+        let writer = unsafe { (*self.mmap.get()).writer::<BitMap>(block_off) };
+        writer.write(|b| {
+            debug_assert!(grave_off.num_slots == 1, "range free not implemented yet");
+            b.free_single(grave_off.slot_idx);
+        });
+
+        Ok(())
+    }
+
+    fn is_tail_block_full_nolock(&self, kind: GrowKind) -> bool {
         let (bmap_tail_idx, aarr_tail_idx) = self.meta_read(|a| (a.bmap_tail_idx, a.aarr_tail_idx));
         let block_offset = match kind {
             GrowKind::BitMap => METADATA_SIZE + (bmap_tail_idx as usize * BLOCK_SIZE),
@@ -166,7 +214,12 @@ impl Index {
         let reader = unsafe { (*self.mmap.get()).reader::<BlockHeader>(block_offset) };
         let free_count = reader.read(|header| header.get_free());
 
-        Ok(free_count == 0)
+        free_count == 0
+    }
+
+    fn is_tail_block_full(&self, kind: GrowKind) -> GraveResult<bool> {
+        let _r = self.lock.read()?;
+        Ok(self.is_tail_block_full_nolock(kind))
     }
 
     fn grow(&self, kind: GrowKind) -> GraveResult<()> {
@@ -182,7 +235,7 @@ impl Index {
         // re-check under exclusive access
         //
         // NOTE: stronger validations are theere to prevent allocating more then required resources
-        if !self.is_tail_block_full(kind)? {
+        if !self.is_tail_block_full_nolock(kind) {
             return Ok(());
         }
 
@@ -209,7 +262,7 @@ impl Index {
         mmap.unmap()?;
         self.file.zero_extend(new_len)?;
         self.file.sync()?;
-        *mmap = MemMap::map(&self.file, new_len, IOFlushMode::Background)?;
+        *mmap = MemMap::map(&self.file, new_len, MAP_FLUSH_MODE)?;
 
         // S3: update current & new tail
         let meta = mmap.reader::<Metadata>(METADATA_OFF);
@@ -468,6 +521,69 @@ impl BlockHeader {
 }
 
 //
+// Grave Offset
+//
+
+pub(crate) type TGraveOff = u64;
+
+#[derive(Debug)]
+pub(crate) struct GraveOff {
+    flag: u8, // 0 or 1
+    block_idx: u32,
+    slot_idx: u16,
+    num_slots: u32,
+}
+
+impl GraveOff {
+    const FLAG_BITS: u64 = 1;
+    const BLOCK_IDX_BITS: u64 = 27;
+    const SLOT_IDX_BITS: u64 = 12;
+    const NUM_SLOTS_BITS: u64 = 24;
+
+    const NUM_SLOTS_MASK: u64 = (1u64 << Self::NUM_SLOTS_BITS) - 1;
+    const SLOT_IDX_MASK: u64 = (1u64 << Self::SLOT_IDX_BITS) - 1;
+    const BLOCK_IDX_MASK: u64 = (1u64 << Self::BLOCK_IDX_BITS) - 1;
+    const FLAG_MASK: u64 = 1;
+
+    const NUM_SLOTS_SHIFT: u64 = 0;
+    const SLOT_IDX_SHIFT: u64 = Self::NUM_SLOTS_BITS;
+    const BLOCK_IDX_SHIFT: u64 = Self::NUM_SLOTS_BITS + Self::SLOT_IDX_BITS;
+    const FLAG_SHIFT: u64 = Self::NUM_SLOTS_BITS + Self::SLOT_IDX_BITS + Self::BLOCK_IDX_BITS;
+
+    #[inline]
+    pub(crate) fn encode(&self) -> TGraveOff {
+        debug_assert!(self.flag <= 1);
+        debug_assert!(self.num_slots > 0);
+        debug_assert!(self.block_idx <= MAX_PAGE_INDEX);
+        debug_assert!((self.slot_idx as usize) < PAGES_PER_BLOCK);
+        debug_assert!((self.num_slots as u64) <= Self::NUM_SLOTS_MASK);
+
+        ((self.flag as u64 & Self::FLAG_MASK) << Self::FLAG_SHIFT)
+            | ((self.block_idx as u64 & Self::BLOCK_IDX_MASK) << Self::BLOCK_IDX_SHIFT)
+            | ((self.slot_idx as u64 & Self::SLOT_IDX_MASK) << Self::SLOT_IDX_SHIFT)
+            | (self.num_slots as u64 & Self::NUM_SLOTS_MASK)
+    }
+
+    #[inline]
+    pub(crate) fn decode(off: TGraveOff) -> Self {
+        let flag = ((off >> Self::FLAG_SHIFT) & Self::FLAG_MASK) as u8;
+        let block_idx = ((off >> Self::BLOCK_IDX_SHIFT) & Self::BLOCK_IDX_MASK) as u32;
+        let slot_idx = ((off >> Self::SLOT_IDX_SHIFT) & Self::SLOT_IDX_MASK) as u16;
+        let num_slots = (off & Self::NUM_SLOTS_MASK) as u32;
+
+        debug_assert!(flag <= 1);
+        debug_assert!(num_slots > 0);
+
+        Self {
+            flag,
+            block_idx,
+            slot_idx,
+            num_slots,
+        }
+    }
+}
+
+//
 // BitMap
 //
 
@@ -489,7 +605,7 @@ impl BitMap {
         debug_assert!(self.header.is_bitmap(), "Invalid block");
 
         // current block is full
-        if unlikely(self.header.get_free() == 0) {
+        if common::unlikely(self.header.get_free() == 0) {
             return None;
         }
 
@@ -509,6 +625,7 @@ impl BitMap {
             let bit = 1u16 << free_bit;
 
             // sanity checks
+            debug_assert!(word_idx <= MAX_CURRNET_PTR as usize);
             debug_assert!((*word & bit) == 0, "bitmap corruption");
             debug_assert!(free_bit < 0x10, "invalid trailing_zeros result");
 
