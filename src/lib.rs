@@ -6,6 +6,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![doc = include_str!("../README.md")]
 
+#[allow(unused)]
+mod hints;
+
 /// A page based storage engine with fire-and-forget writes and crash-safe durability semantics
 ///
 /// # Example
