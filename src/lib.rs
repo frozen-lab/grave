@@ -23,7 +23,7 @@ mod index;
 pub use cfg::{GraveConfig, GraveConfigValue};
 use coffin::Coffin;
 pub use errors::{GraveError, GraveResult};
-use index::{Index, TGraveOff, PAGES_PER_BLOCK};
+use index::{GraveOff, Index, TGraveOff, PAGES_PER_BLOCK};
 use pool::{BufPool, PoolSlot};
 
 /// A page based storage engine with fire-and-forget writes and crash-safe durability semantics
@@ -62,13 +62,13 @@ impl Grave {
         let (index, coffin) = if is_new {
             (
                 Index::new(dirpath.as_ref(), &cfg)?,
-                Coffin::new(dirpath.as_ref(), PAGES_PER_BLOCK, cfg.page_size as usize)?,
+                Coffin::new(dirpath.as_ref(), PAGES_PER_BLOCK, cfg.page_size.to_u32() as usize)?,
             )
         } else {
             (Index::open(dirpath.as_ref())?, Coffin::open(dirpath.as_ref())?)
         };
 
-        let pool = BufPool::new(cfg.num_block as u32, cfg.page_size as usize);
+        let pool = BufPool::new(cfg.num_block as u32, cfg.page_size.to_u32() as usize);
 
         Ok(Self {
             cfg,
@@ -82,7 +82,7 @@ impl Grave {
     ///
     pub fn write(&self, data: &[u8]) -> GraveResult<TGraveOff> {
         // sanity check (for now)
-        debug_assert!(data.len() <= self.cfg.page_size as usize);
+        debug_assert!(data.len() <= self.cfg.page_size.to_u32() as usize);
 
         let off = self.index.alloc_single_slot()?;
         let slot = (off.slot_idx as usize) * (off.block_idx as usize);
@@ -108,18 +108,27 @@ impl Grave {
             std::ptr::copy_nonoverlapping(data.as_ptr(), pslot.ptr(), data.len());
         }
 
-        self.coffin.write(data.as_ptr(), slot, self.cfg.page_size as usize)?;
+        self.coffin
+            .write(data.as_ptr(), slot, self.cfg.page_size.to_u32() as usize)?;
         self.pool.free(&pslot);
         Ok(0)
     }
 
     ///
-    pub fn read(&self, _off: TGraveOff) -> GraveResult<Option<Vec<u8>>> {
-        Ok(None)
+    pub fn read(&self, off: TGraveOff) -> GraveResult<Option<Vec<u8>>> {
+        let grave_off = GraveOff::decode(off);
+        let slot = (grave_off.slot_idx as usize) * (grave_off.block_idx as usize);
+
+        let mut data = vec![0u8; self.cfg.page_size.to_u32() as usize];
+        self.coffin
+            .read(data.as_mut_ptr(), slot, self.cfg.page_size.to_u32() as usize)?;
+
+        Ok(Some(data))
     }
 
     ///
-    pub fn del(&self, _off: TGraveOff) -> GraveResult<()> {
+    pub fn del(&self, off: TGraveOff) -> GraveResult<()> {
+        self.index.free_single_slot(off)?;
         Ok(())
     }
 
