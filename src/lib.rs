@@ -21,9 +21,10 @@ mod file;
 mod index;
 
 pub use cfg::{GraveConfig, GraveConfigValue};
+use coffin::Coffin;
 pub use errors::{GraveError, GraveResult};
-use index::{Index, TGraveOff};
-use pool::BufPool;
+use index::{Index, TGraveOff, PAGES_PER_BLOCK};
+use pool::{BufPool, PoolSlot};
 
 /// A page based storage engine with fire-and-forget writes and crash-safe durability semantics
 ///
@@ -39,6 +40,7 @@ use pool::BufPool;
 pub struct Grave {
     index: Index,
     pool: BufPool,
+    coffin: Coffin,
     cfg: GraveConfig,
     dirpath: std::path::PathBuf,
 }
@@ -57,11 +59,14 @@ impl Grave {
         #[cfg(target_os = "linux")]
         Self::prep_directory(dirpath.as_ref())?;
 
-        let index = if is_new {
-            Index::new(dirpath.as_ref(), &cfg)
+        let (index, coffin) = if is_new {
+            (
+                Index::new(dirpath.as_ref(), &cfg)?,
+                Coffin::new(dirpath.as_ref(), PAGES_PER_BLOCK, cfg.page_size as usize)?,
+            )
         } else {
-            Index::open(dirpath.as_ref())
-        }?;
+            (Index::open(dirpath.as_ref())?, Coffin::open(dirpath.as_ref())?)
+        };
 
         let pool = BufPool::new(cfg.num_block as u32, cfg.page_size as usize);
 
@@ -69,16 +74,42 @@ impl Grave {
             cfg,
             pool,
             index,
+            coffin,
             dirpath: dirpath.as_ref().clone(),
         })
     }
 
     ///
-    pub fn write(&self, _data: &[u8]) -> GraveResult<TGraveOff> {
-        let off = self.index.alloc_single_slot()?;
-        let _slot = (off.slot_idx as usize) * (off.block_idx as usize);
-        let _ptr = self.pool.alloc().unwrap().ptr();
+    pub fn write(&self, data: &[u8]) -> GraveResult<TGraveOff> {
+        // sanity check (for now)
+        debug_assert!(data.len() <= self.cfg.page_size as usize);
 
+        let off = self.index.alloc_single_slot()?;
+        let slot = (off.slot_idx as usize) * (off.block_idx as usize);
+
+        let mut pool_slot: Option<PoolSlot> = None;
+
+        while pool_slot.is_none() {
+            if let Some(pslot) = self.pool.alloc() {
+                pool_slot = Some(pslot);
+                break;
+            } else {
+                self.pool.wait();
+            }
+        }
+
+        let pslot = if pool_slot.is_some() {
+            pool_slot.unwrap()
+        } else {
+            return Err(GraveError::Miscellaneous("".into()));
+        };
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), pslot.ptr(), data.len());
+        }
+
+        self.coffin.write(data.as_ptr(), slot, self.cfg.page_size as usize)?;
+        self.pool.free(&pslot);
         Ok(0)
     }
 

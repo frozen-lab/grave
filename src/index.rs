@@ -21,7 +21,7 @@ const MIN_BLOCKS_ON_INIT: usize = 2;
 const DEFAULT_BITMAP_IDX: usize = 0;
 const DEFAULT_ADJARR_IDX: usize = 1;
 const BLOCK_HEADER_SIZE: usize = std::mem::size_of::<BlockHeader>();
-const PAGES_PER_BLOCK: usize = (BLOCK_SIZE - BLOCK_HEADER_SIZE) * 8;
+pub(crate) const PAGES_PER_BLOCK: usize = (BLOCK_SIZE - BLOCK_HEADER_SIZE) * 8;
 
 const MAX_CURRNET_PTR: u8 = 0xFF; // 8 bits  (0..=255)
 const MAX_FREE_PER_BLOCK: u16 = 0x0FFF; // 12 bits (0..=4095)
