@@ -12,8 +12,6 @@ mod error;
 #[allow(unused)]
 mod hints;
 
-pub use error::{GraveError, GraveResult};
-
 /// A page based storage engine with fire-and-forget writes and crash-safe durability semantics
 ///
 /// # Example

@@ -1,75 +1,43 @@
-//
-// Grave Error
-//
-
-/// A custom finite set of errors, which are exposed by [`Grave`]
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum GraveError {
-    /// Represents an underlying I/O error (file system, OS, etc.)
-    IO(String),
-
-    /// Represents a lack of **write/read** permissions for I/O ops on a File or Dir
-    NoPerm(String),
-
-    /// Represents a multithreading error, where a thread fails while a lock is held
-    LockPoisoned(String),
-
-    /// A fallback for unexpected or uncategorized errors.
-    Miscellaneous(String),
-
-    /// Represents invalid internal state for [`Grave`], which is caused when internal
-    /// data is un-aligned, missing, is tampered or corrupted.
-    InvalidState(String),
-}
-
-impl From<std::io::Error> for GraveError {
-    fn from(e: std::io::Error) -> Self {
-        GraveError::IO(format!("{}", e))
-    }
-}
-
-impl<T> From<std::sync::PoisonError<T>> for GraveError {
-    fn from(e: std::sync::PoisonError<T>) -> Self {
-        GraveError::LockPoisoned(format!("{}", e))
-    }
-}
-
-impl From<InternalError> for GraveError {
-    fn from(err: InternalError) -> Self {
-        match err {
-            InternalError::IO(e) => Self::IO(e),
-            InternalError::Misc(e) => Self::Miscellaneous(e),
-            InternalError::LockPoisoned(e) => Self::LockPoisoned(e),
-            InternalError::InvalidState(e) => Self::InvalidState(e),
-        }
-    }
-}
-
 /// A specialized result type for operations in [`Grave`]
 pub type GraveResult<T> = Result<T, GraveError>;
 
-//
-// Internal Error
-//
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum InternalError {
-    IO(String),
-    Misc(String),
-    LockPoisoned(String),
-    InvalidState(String),
+/// A custom error object, which descibes errored state exposed by [`Grave`]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct GraveError {
+    code: ErrorCode,
+    cntx: &'static str,
 }
 
-impl From<std::io::Error> for InternalError {
-    fn from(e: std::io::Error) -> Self {
-        InternalError::IO(format!("{}", e))
+impl GraveError {
+    #[inline]
+    pub const fn code(&self) -> u16 {
+        self.code as u16
+    }
+
+    #[inline]
+    pub const fn context(&self) -> &'static str {
+        self.cntx
     }
 }
 
-impl<T> From<std::sync::PoisonError<T>> for InternalError {
-    fn from(e: std::sync::PoisonError<T>) -> Self {
-        InternalError::LockPoisoned(format!("{}", e))
-    }
-}
+#[repr(u16)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum ErrorCode {
+    // I/O
+    IOHcf = 0x100,
+    IOUnk = 0x101,
+    IONsp = 0x102,
+    IONpm = 0x103,
+    IOSnc = 0x104,
 
-pub(crate) type InternalResult<T> = Result<T, InternalError>;
+    // Internal
+    INHcf = 0x200,
+    INGrt = 0x201,
+
+    // Multi threading
+    MTHcf = 0x300,
+    MTLoc = 0x301,
+
+    // Misc
+    GMisc = 0xFFFF,
+}
