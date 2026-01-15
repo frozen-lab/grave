@@ -7,7 +7,12 @@
 #![doc = include_str!("../README.md")]
 
 #[allow(unused)]
+mod error;
+
+#[allow(unused)]
 mod hints;
+
+pub use error::{GraveError, GraveResult};
 
 /// A page based storage engine with fire-and-forget writes and crash-safe durability semantics
 ///
