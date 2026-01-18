@@ -493,8 +493,10 @@ unsafe impl Sync for LinuxFile {}
 ///
 /// To remain sane across ownership models, containers, and shared filesystems,
 /// we explicitly retry the `open()` w/o `O_NOATIME` when `EPERM` is encountered
-unsafe fn open_with_flags(path: &std::path::PathBuf, flags: i32) -> GraveResult<i32> {
+unsafe fn open_with_flags(path: &std::path::PathBuf, mut flags: i32) -> GraveResult<i32> {
     let cpath = path_to_cstring(path)?;
+    let mut tried_noatime = false;
+
     loop {
         let fd = if flags & O_CREAT != 0 {
             open(
@@ -518,15 +520,11 @@ unsafe fn open_with_flags(path: &std::path::PathBuf, flags: i32) -> GraveResult<
             continue;
         }
 
-        // NOTE: Fallback for `EPERM` error!
-        if err_raw == Some(EPERM) {
-            #[cfg(test)]
-            debug_assert!((flags & O_NOATIME) != 0, "O_NOATIME flag is not being used");
-
-            let fd = open(cpath.as_ptr(), flags & !O_NOATIME);
-            if fd >= 0 {
-                return Ok(fd);
-            }
+        // NOTE: Fallback for `EPERM` error, when `O_NOATIME` is not supported by current FS
+        if err_raw == Some(EPERM) && (flags & O_NOATIME) != 0 && !tried_noatime {
+            flags &= !O_NOATIME;
+            tried_noatime = true;
+            continue;
         }
 
         // no space available on disk
@@ -588,4 +586,281 @@ fn path_to_cstring(path: &std::path::PathBuf) -> GraveResult<CString> {
 #[inline]
 fn last_os_error() -> std::io::Error {
     std::io::Error::last_os_error()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::{tempdir, TempDir};
+
+    fn new_tmp() -> (TempDir, PathBuf, LinuxFile) {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+        let file = unsafe { LinuxFile::new(tmp.clone()) }.expect("new LinuxFile");
+
+        (dir, tmp, file)
+    }
+
+    mod new_open {
+        use super::*;
+
+        #[test]
+        fn new_works() {
+            let (_dir, tmp, file) = new_tmp();
+            assert!(file.fd() >= 0);
+
+            // sanity check
+            assert!(tmp.exists());
+            assert!(unsafe { file.close().is_ok() });
+        }
+
+        #[test]
+        fn open_works() {
+            let (_dir, tmp, file) = new_tmp();
+            unsafe {
+                assert!(file.fd() >= 0);
+                assert!(file.close().is_ok());
+
+                match LinuxFile::open(tmp) {
+                    Ok(file) => {
+                        assert!(file.fd() >= 0);
+                        assert!(file.close().is_ok());
+                    }
+                    Err(e) => panic!("failed to open file due to E: {e}"),
+                }
+            }
+        }
+
+        #[test]
+        fn open_fails_when_file_is_unlinked() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.fd() >= 0);
+                assert!(file.close().is_ok());
+                assert!(file.unlink().is_ok());
+
+                let file = LinuxFile::open(tmp);
+                assert!(file.is_err());
+            }
+        }
+    }
+
+    mod close {
+        use super::*;
+
+        #[test]
+        fn close_works() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close().is_ok());
+
+                // sanity check
+                assert!(tmp.exists());
+            }
+        }
+
+        #[test]
+        fn close_after_close_does_not_fail() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                // should never fail
+                assert!(file.close().is_ok());
+                assert!(file.close().is_ok());
+                assert!(file.close().is_ok());
+
+                // sanity check
+                assert!(tmp.exists());
+            }
+
+            // NOTE: We need this protection, cause in multithreaded env's, more then one thread
+            // could try to close the file at same time, hence the system should not panic in these cases
+        }
+    }
+
+    mod unlink {
+        use super::*;
+
+        #[test]
+        fn unlink_correctly_deletes_file() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close().is_ok());
+                assert!(file.unlink().is_ok());
+                assert!(!tmp.exists());
+            }
+        }
+
+        #[test]
+        fn unlink_fails_on_unlinked_file() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close().is_ok());
+                assert!(file.unlink().is_ok());
+                assert!(!tmp.exists());
+
+                // should fail on missing
+                assert!(file.unlink().is_err());
+            }
+        }
+    }
+
+    mod extend {
+        use super::*;
+
+        #[test]
+        fn extend_zero_extends_file() {
+            const NEW_LEN: u64 = 0x80;
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.extend(NEW_LEN).is_ok());
+                assert_eq!(file.len(), NEW_LEN);
+                assert!(file.close().is_ok());
+            }
+
+            // strict sanity check to ensure file is zero byte extended
+            let file_contents = std::fs::read(&tmp).expect("read from file");
+            assert_eq!(file_contents.len(), NEW_LEN as usize, "len mismatch for file");
+            assert!(
+                file_contents.iter().all(|b| *b == 0u8),
+                "file must be zero byte extended"
+            );
+        }
+
+        #[test]
+        fn open_preserves_existing_length() {
+            const NEW_LEN: u64 = 0x80;
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.extend(NEW_LEN).is_ok());
+                assert_eq!(file.len(), NEW_LEN);
+                assert!(file.sync().is_ok());
+                assert!(file.close().is_ok());
+
+                match LinuxFile::open(tmp) {
+                    Err(e) => panic!("{e}"),
+                    Ok(file) => {
+                        assert_eq!(file.len(), NEW_LEN);
+                    }
+                }
+            }
+        }
+    }
+
+    mod lock_unlock {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[test]
+        fn lock_unlock_cycle() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.lock().is_ok());
+                assert!(file.unlock().is_ok());
+
+                assert!(file.lock().is_ok());
+                assert!(file.unlock().is_ok());
+
+                assert!(file.close().is_ok());
+            }
+        }
+
+        #[test]
+        fn lock_survives_io_operation() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.lock().is_ok());
+
+                let data = vec![1u8; 0x20];
+                file.extend(data.len() as u64).expect("resize file");
+                file.pwrite(data.as_ptr(), 0, data.len()).expect("write to file");
+
+                assert!(file.unlock().is_ok());
+                assert!(file.close().is_ok());
+            }
+        }
+    }
+
+    mod write_read {
+        use super::*;
+
+        #[test]
+        fn pwrite_pread_cycle() {
+            let (_dir, tmp, file) = new_tmp();
+
+            const LEN: usize = 0x20;
+            const DATA: [u8; LEN] = [0x1A; LEN];
+
+            unsafe {
+                file.extend(LEN as u64).expect("resize file");
+                assert!(file.pwrite(DATA.as_ptr(), 0, LEN).is_ok());
+
+                let mut buf = vec![0u8; LEN];
+                assert!(file.pread(buf.as_mut_ptr(), 0, LEN).is_ok());
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+                assert!(file.close().is_ok());
+            }
+        }
+
+        #[test]
+        fn pwritev_pread_cycle() {
+            let (_dir, tmp, file) = new_tmp();
+
+            const LEN: usize = 0x20;
+            const DATA: [u8; LEN] = [0x1A; LEN];
+
+            let ptrs = vec![DATA.as_ptr(); 0x10];
+            let total_len = ptrs.len() * LEN;
+
+            unsafe {
+                file.extend(total_len as u64).expect("resize file");
+                assert!(file.pwritev(&ptrs, 0, LEN).is_ok());
+
+                let mut buf = vec![0u8; total_len];
+                assert!(file.pread(buf.as_mut_ptr(), 0, total_len).is_ok(), "pread failed");
+                assert_eq!(buf.len(), total_len, "mismatch between read and write");
+
+                for chunk in buf.chunks_exact(LEN) {
+                    assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
+                }
+
+                assert!(file.close().is_ok());
+            }
+        }
+
+        #[test]
+        fn pwrite_pread_cycle_across_sessions() {
+            let (_dir, tmp, file) = new_tmp();
+
+            const LEN: usize = 0x20;
+            const DATA: [u8; LEN] = [0x1A; LEN];
+
+            // create + write + sync + close
+            unsafe {
+                file.extend(LEN as u64).expect("resize file");
+                assert!(file.pwrite(DATA.as_ptr(), 0, LEN).is_ok());
+                assert!(file.sync().is_ok());
+                assert!(file.close().is_ok());
+            }
+
+            // open + read + verify
+            unsafe {
+                let file = LinuxFile::open(tmp).expect("open file");
+
+                let mut buf = vec![0u8; LEN];
+                assert!(file.pread(buf.as_mut_ptr(), 0, LEN).is_ok());
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+                assert!(file.close().is_ok());
+            }
+        }
+    }
 }

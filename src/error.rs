@@ -37,6 +37,12 @@ impl GraveError {
     }
 }
 
+impl std::fmt::Display for GraveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GraveError {{code: {}, context: {}}}", self.code as u16, self.cntx)
+    }
+}
+
 /// Error codes for internal use
 ///
 /// ## HCF errors
@@ -47,16 +53,16 @@ impl GraveError {
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum ErrorCode {
     // path
-    PHInv = 0x80,
+    PHInv = 0x80, // 128
 
     // I/O Permissions
-    PMWrt = 0x101,
+    PMWrt = 0x101, // 257
 
     // I/O
-    IOHcf = 0x200,
-    IOUnk = 0x201,
-    IONsp = 0x202,
-    IOLck = 0x203,
-    IOEof = 0x204,
-    IOSyn = 0x205,
+    IOHcf = 0x200, // 512
+    IOUnk = 0x201, // 513
+    IONsp = 0x202, // 514
+    IOLck = 0x203, // 515
+    IOEof = 0x204, // 516
+    IOSyn = 0x205, // 517
 }
