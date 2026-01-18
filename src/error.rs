@@ -65,4 +65,8 @@ pub(crate) enum ErrorCode {
     IOLck = 0x203, // 515
     IOEof = 0x204, // 516
     IOSyn = 0x205, // 517
+
+    // multithreading
+    MTUnk = 0x300, // 768
+    MTMpn = 0x301, // 769 (mutext poisoned)
 }
