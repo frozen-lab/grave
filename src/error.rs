@@ -52,21 +52,57 @@ impl std::fmt::Display for GraveError {
 #[repr(u16)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) enum ErrorCode {
-    // path
-    PHInv = 0x80, // 128
+    /// (512) internal fuck up
+    IOHcf = 0x200,
+    /// (513) unknown IO error (fallback)
+    IOUnk = 0x201,
+    /// (514) no more space available
+    IONsp = 0x202,
+    /// (515) IO lock error (failed to obtain lock)
+    IOLck = 0x203,
+    /// (516) exexpected eof, mainly while writing
+    IOEof = 0x204,
+    /// (517) syncing error
+    IOSyn = 0x205,
 
-    // I/O Permissions
-    PMWrt = 0x101, // 257
+    /// (768) unknown thread error
+    MTUnk = 0x300,
+    /// (769) mutext posioned
+    MTMpn = 0x301,
+    /// (770) thread paniced
+    MTTpn = 0x302,
 
-    // I/O
-    IOHcf = 0x200, // 512
-    IOUnk = 0x201, // 513
-    IONsp = 0x202, // 514
-    IOLck = 0x203, // 515
-    IOEof = 0x204, // 516
-    IOSyn = 0x205, // 517
+    /// (128) invalid path
+    PHInv = 0x80,
 
-    // multithreading
-    MTUnk = 0x300, // 768
-    MTMpn = 0x301, // 769 (mutext poisoned)
+    /// (256) no write perm
+    PMWrt = 0x100,
+    /// (257) no read perm
+    PMRed = 0x101,
+}
+
+impl ErrorCode {
+    #[inline]
+    pub(crate) const fn from_u16(code: u16) -> Self {
+        match code {
+            // WARN: Error code must never be 0, as its used as placeholder for sane state (non errored state)
+            0 => unimplemented!(),
+
+            0x80 => ErrorCode::PHInv,
+            0x101 => ErrorCode::PMWrt,
+
+            0x200 => ErrorCode::IOHcf,
+            0x201 => ErrorCode::IOUnk,
+            0x202 => ErrorCode::IONsp,
+            0x203 => ErrorCode::IOLck,
+            0x204 => ErrorCode::IOEof,
+            0x205 => ErrorCode::IOSyn,
+
+            0x300 => ErrorCode::MTUnk,
+            0x301 => ErrorCode::MTMpn,
+            0x302 => ErrorCode::MTTpn,
+
+            _ => Self::IOUnk, // defensive fallback
+        }
+    }
 }
