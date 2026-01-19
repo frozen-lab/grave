@@ -472,7 +472,6 @@ impl LinuxFile {
     }
 
     #[inline]
-    #[cfg(debug_assertions)]
     fn sanity_check(&self) {
         debug_assert!(self.fd() >= 0, "Invalid fd for LinuxFile");
     }
@@ -761,7 +760,6 @@ mod tests {
 
     mod lock_unlock {
         use super::*;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
         #[test]
         fn lock_unlock_cycle() {

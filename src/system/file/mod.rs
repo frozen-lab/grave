@@ -133,6 +133,9 @@ impl OsFile {
             self.core.cv.notify_one();
         }
 
+        // NOTE: we must wait for sync thread to exit to avoid use of operations using
+        // invalid fd (which is after close, i.e. fd = -1)
+        let _guard = self.core.lock.lock();
         let file = self.get_file();
 
         #[cfg(not(target_os = "linux"))]
@@ -191,7 +194,17 @@ impl OsFile {
         Ok(())
     }
 
-    fn close(&self) -> GraveResult<()> {
+    /// Close the [`OsFile`]
+    ///
+    /// **For internal use only**
+    ///
+    /// ## Usage
+    ///
+    /// We only use close in following scenerios:
+    ///
+    /// - When deleting the file
+    /// - When dropping the file
+    fn _close(&self) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
@@ -232,7 +245,9 @@ impl OsFile {
 
 impl Drop for OsFile {
     fn drop(&mut self) {
-        self.core.closed.store(true, atomic::Ordering::Release);
+        if self.core.closed.swap(true, atomic::Ordering::AcqRel) {
+            return;
+        }
 
         // close flusher thread
         if self.core.mode == IOFlushMode::Background {
@@ -240,11 +255,11 @@ impl Drop for OsFile {
         }
 
         // sync if dirty
-        if self.core.dirty.load(atomic::Ordering::Acquire) {
+        if self.core.dirty.swap(false, atomic::Ordering::AcqRel) {
             let _ = self.sync();
         }
 
-        let _ = self.close();
+        let _ = self._close();
     }
 }
 
@@ -342,10 +357,6 @@ impl InternalFile {
 
         // sync loop w/ non-busy waiting
         loop {
-            if core.closed.load(atomic::Ordering::Acquire) {
-                return;
-            }
-
             guard = match core.cv.wait_timeout(guard, FLUSH_DURATION) {
                 Ok((g, _)) => g,
                 Err(_) => {
@@ -355,13 +366,12 @@ impl InternalFile {
                 }
             };
 
+            if core.closed.load(atomic::Ordering::Acquire) {
+                return;
+            }
+
             if core.dirty.swap(false, atomic::Ordering::AcqRel) {
                 drop(guard);
-
-                // protection against delete
-                if core.closed.load(atomic::Ordering::Acquire) {
-                    return;
-                }
 
                 if unsafe { (&*core.file.get()).sync() }.is_err() {
                     core.err_code.store(ErrorCode::IOSyn as u16, atomic::Ordering::Release);
@@ -421,6 +431,7 @@ mod tests {
         fn new_works() {
             let (_dir, tmp, file) = new_tmp();
             assert!(file.fd() >= 0);
+            assert_eq!(file.len(), LEN as u64);
             assert!(!file.core.closed.load(atomic::Ordering::Acquire));
             assert!(!file.core.errored.load(atomic::Ordering::Acquire));
 
@@ -433,6 +444,7 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
             unsafe {
                 assert!(file.fd() >= 0);
+                assert_eq!(file.len(), LEN as u64);
                 assert!(!file.core.closed.load(atomic::Ordering::Acquire));
                 assert!(!file.core.errored.load(atomic::Ordering::Acquire));
                 drop(file);
@@ -440,6 +452,7 @@ mod tests {
                 match OsFile::open(tmp, MODE) {
                     Ok(file) => {
                         assert!(file.fd() >= 0);
+                        assert_eq!(file.len(), LEN as u64);
                         assert!(!file.core.closed.load(atomic::Ordering::Acquire));
                         assert!(!file.core.errored.load(atomic::Ordering::Acquire));
                     }
@@ -454,6 +467,7 @@ mod tests {
 
             unsafe {
                 assert!(file.fd() >= 0);
+                assert_eq!(file.len(), LEN as u64);
                 assert!(file.delete().is_ok());
 
                 let file = OsFile::open(tmp, MODE);
@@ -462,45 +476,11 @@ mod tests {
         }
     }
 
-    mod close {
-        use super::*;
-
-        #[test]
-        fn close_works() {
-            let (_dir, tmp, file) = new_tmp();
-
-            unsafe {
-                assert!(file.close().is_ok());
-
-                // sanity check
-                assert!(tmp.exists());
-            }
-        }
-
-        #[test]
-        fn close_after_close_does_not_fail() {
-            let (_dir, tmp, file) = new_tmp();
-
-            unsafe {
-                // should never fail
-                assert!(file.close().is_ok());
-                assert!(file.close().is_ok());
-                assert!(file.close().is_ok());
-
-                // sanity check
-                assert!(tmp.exists());
-            }
-
-            // NOTE: We need this protection, cause in multithreaded env's, more then one thread
-            // could try to close the file at same time, hence the system should not panic in these cases
-        }
-    }
-
     mod delete {
         use super::*;
 
         #[test]
-        fn delete_works_on_open_file() {
+        fn delete_works() {
             let (_dir, tmp, file) = new_tmp();
 
             unsafe {
@@ -509,33 +489,6 @@ mod tests {
                 // sanity checks
                 assert!(!tmp.exists());
                 assert!(file.core.closed.load(atomic::Ordering::Acquire));
-            }
-        }
-
-        #[test]
-        fn delete_works_on_closed_file() {
-            let (_dir, tmp, file) = new_tmp();
-
-            unsafe {
-                assert!(file.close().is_ok());
-                assert!(file.delete().is_ok());
-
-                // sanity checks
-                assert!(file.core.closed.load(atomic::Ordering::Acquire));
-                assert!(!tmp.exists());
-            }
-        }
-
-        #[test]
-        fn deleting_osfile_works() {
-            let (_dir, tmp, file) = new_tmp();
-
-            unsafe {
-                assert!(file.delete().is_ok());
-
-                // sanity checks
-                assert!(file.core.closed.load(atomic::Ordering::Acquire));
-                assert!(!tmp.exists());
             }
         }
 
@@ -567,7 +520,6 @@ mod tests {
             unsafe {
                 assert!(file.extend(NEW_LEN).is_ok());
                 assert_eq!(file.len(), NEW_LEN + LEN as u64);
-                assert!(file.close().is_ok());
             }
 
             // strict sanity check to ensure file is zero byte extended
@@ -587,8 +539,10 @@ mod tests {
             unsafe {
                 assert!(file.extend(NEW_LEN).is_ok());
                 assert_eq!(file.len(), NEW_LEN + LEN as u64);
-                assert!(file.sync().is_ok());
-                assert!(file.close().is_ok());
+
+                // allow sync thread to run and persist
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                drop(file);
 
                 match OsFile::open(tmp, MODE) {
                     Err(e) => panic!("{e}"),
@@ -602,7 +556,6 @@ mod tests {
 
     mod lock_unlock {
         use super::*;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
         #[test]
         fn lock_unlock_cycle() {
@@ -637,12 +590,13 @@ mod tests {
         #[test]
         fn single_write_read_cycle() {
             const DATA: [u8; LEN] = [0x1A; LEN];
+
             let (_dir, tmp, file) = new_tmp();
+            let mut buf = vec![0u8; LEN];
 
             unsafe {
                 assert!(file.write_single(DATA.as_ptr(), 0, LEN).is_ok());
 
-                let mut buf = vec![0u8; LEN];
                 assert!(file.read(buf.as_mut_ptr(), 0, LEN).is_ok());
                 assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
             }
@@ -655,12 +609,12 @@ mod tests {
 
             let ptrs = vec![DATA.as_ptr(); 0x10];
             let total_len = ptrs.len() * LEN;
+            let mut buf = vec![0u8; total_len];
 
             unsafe {
                 file.extend(total_len as u64).expect("resize file");
                 assert!(file.write_multi(&ptrs, 0, LEN).is_ok());
 
-                let mut buf = vec![0u8; total_len];
                 assert!(file.read(buf.as_mut_ptr(), 0, total_len).is_ok(), "read failed");
                 assert_eq!(buf.len(), total_len, "mismatch between read and write");
 
@@ -686,12 +640,11 @@ mod tests {
 
             // open + read + verify
             unsafe {
+                let mut buf = vec![0u8; LEN];
                 let file = OsFile::open(tmp, MODE).expect("open file");
 
-                let mut buf = vec![0u8; LEN];
                 assert!(file.read(buf.as_mut_ptr(), 0, LEN).is_ok());
                 assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
-                assert!(file.close().is_ok());
             }
         }
     }
