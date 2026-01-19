@@ -866,4 +866,70 @@ mod tests {
             }
         }
     }
+
+    mod concurrency {
+        use super::*;
+
+        #[test]
+        fn concurrent_writes_then_read() {
+            const THREADS: usize = 8;
+            const CHUNK: usize = 0x100;
+
+            let (_dir, _tmp, file) = new_tmp();
+            let file = std::sync::Arc::new(file);
+
+            // required len
+            unsafe { file.extend((THREADS * CHUNK) as u64).expect("extend") };
+
+            let mut handles = Vec::new();
+            for i in 0..THREADS {
+                let f = file.clone();
+                handles.push(std::thread::spawn(move || {
+                    let data = vec![i as u8; CHUNK];
+                    unsafe { f.pwrite(data.as_ptr(), i * CHUNK, CHUNK).expect("write") };
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+
+            //
+            // read back (sanity check)
+            //
+
+            let mut read_buf = vec![0u8; THREADS * CHUNK];
+            unsafe { assert!(file.pread(read_buf.as_mut_ptr(), 0, read_buf.len()).is_ok()) };
+
+            for i in 0..THREADS {
+                let chunk = &read_buf[i * CHUNK..(i + 1) * CHUNK];
+                assert!(chunk.iter().all(|b| *b == i as u8));
+            }
+        }
+
+        #[test]
+        fn concurrent_writes_with_lock() {
+            const THREADS: usize = 4;
+            const LEN: usize = 0x80;
+
+            let (_dir, _tmp, file) = new_tmp();
+            let file = std::sync::Arc::new(file);
+
+            unsafe { file.extend(LEN as u64).expect("extend") };
+
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let f = file.clone();
+                handles.push(std::thread::spawn(move || unsafe {
+                    let _guard = f.lock().expect("lock");
+                    let data = vec![0xAB; LEN];
+                    assert!(f.pwrite(data.as_ptr(), 0, LEN).is_ok());
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+        }
+    }
 }

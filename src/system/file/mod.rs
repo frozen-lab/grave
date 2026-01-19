@@ -122,6 +122,8 @@ impl OsFile {
 
     #[inline]
     pub(crate) fn delete(&self) -> GraveResult<()> {
+        let file = self.get_file();
+
         // NOTE: sanity check is invalid here, cause we are deleting the file, hence we don't
         // actually care if the state is sane or not ;)
 
@@ -135,8 +137,9 @@ impl OsFile {
 
         // NOTE: we must wait for sync thread to exit to avoid use of operations using
         // invalid fd (which is after close, i.e. fd = -1)
-        let _guard = self.core.lock.lock();
-        let file = self.get_file();
+        if let Err(e) = self.core.lock.lock() {
+            return GraveError::poison_err::<std::sync::MutexGuard<'_, _>, ()>(ErrorCode::MTMpn, e);
+        }
 
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
@@ -419,7 +422,7 @@ mod tests {
     fn new_tmp() -> (TempDir, PathBuf, OsFile) {
         let dir = tempdir().expect("temp dir");
         let tmp = dir.path().join("tmp_file");
-        let file = unsafe { OsFile::new(tmp.clone(), MODE, LEN as u64) }.expect("new OsFile");
+        let file = OsFile::new(tmp.clone(), MODE, LEN as u64).expect("new OsFile");
 
         (dir, tmp, file)
     }
@@ -442,22 +445,21 @@ mod tests {
         #[test]
         fn open_works() {
             let (_dir, tmp, file) = new_tmp();
-            unsafe {
-                assert!(file.fd() >= 0);
-                assert_eq!(file.len(), LEN as u64);
-                assert!(!file.core.closed.load(atomic::Ordering::Acquire));
-                assert!(!file.core.errored.load(atomic::Ordering::Acquire));
-                drop(file);
 
-                match OsFile::open(tmp, MODE) {
-                    Ok(file) => {
-                        assert!(file.fd() >= 0);
-                        assert_eq!(file.len(), LEN as u64);
-                        assert!(!file.core.closed.load(atomic::Ordering::Acquire));
-                        assert!(!file.core.errored.load(atomic::Ordering::Acquire));
-                    }
-                    Err(e) => panic!("failed to open file due to E: {e}"),
+            assert!(file.fd() >= 0);
+            assert_eq!(file.len(), LEN as u64);
+            assert!(!file.core.closed.load(atomic::Ordering::Acquire));
+            assert!(!file.core.errored.load(atomic::Ordering::Acquire));
+            drop(file);
+
+            match OsFile::open(tmp, MODE) {
+                Ok(file) => {
+                    assert!(file.fd() >= 0);
+                    assert_eq!(file.len(), LEN as u64);
+                    assert!(!file.core.closed.load(atomic::Ordering::Acquire));
+                    assert!(!file.core.errored.load(atomic::Ordering::Acquire));
                 }
+                Err(e) => panic!("failed to open file due to E: {e}"),
             }
         }
 
@@ -465,14 +467,12 @@ mod tests {
         fn open_fails_when_file_is_deleted() {
             let (_dir, tmp, file) = new_tmp();
 
-            unsafe {
-                assert!(file.fd() >= 0);
-                assert_eq!(file.len(), LEN as u64);
-                assert!(file.delete().is_ok());
+            assert!(file.fd() >= 0);
+            assert_eq!(file.len(), LEN as u64);
+            assert!(file.delete().is_ok());
 
-                let file = OsFile::open(tmp, MODE);
-                assert!(file.is_err());
-            }
+            let file = OsFile::open(tmp, MODE);
+            assert!(file.is_err());
         }
     }
 
@@ -483,29 +483,25 @@ mod tests {
         fn delete_works() {
             let (_dir, tmp, file) = new_tmp();
 
-            unsafe {
-                assert!(file.delete().is_ok());
+            assert!(file.delete().is_ok());
 
-                // sanity checks
-                assert!(!tmp.exists());
-                assert!(file.core.closed.load(atomic::Ordering::Acquire));
-            }
+            // sanity checks
+            assert!(!tmp.exists());
+            assert!(file.core.closed.load(atomic::Ordering::Acquire));
         }
 
         #[test]
         fn delete_fails_on_deleted_file() {
             let (_dir, tmp, file) = new_tmp();
 
-            unsafe {
-                assert!(file.delete().is_ok());
+            assert!(file.delete().is_ok());
 
-                // sanity checks
-                assert!(file.core.closed.load(atomic::Ordering::Acquire));
-                assert!(!tmp.exists());
+            // sanity checks
+            assert!(file.core.closed.load(atomic::Ordering::Acquire));
+            assert!(!tmp.exists());
 
-                // should fail on missing
-                assert!(file.delete().is_err());
-            }
+            // should fail on missing
+            assert!(file.delete().is_err());
         }
     }
 
@@ -517,10 +513,8 @@ mod tests {
             const NEW_LEN: u64 = 0x80;
             let (_dir, tmp, file) = new_tmp();
 
-            unsafe {
-                assert!(file.extend(NEW_LEN).is_ok());
-                assert_eq!(file.len(), NEW_LEN + LEN as u64);
-            }
+            assert!(file.extend(NEW_LEN).is_ok());
+            assert_eq!(file.len(), NEW_LEN + LEN as u64);
 
             // strict sanity check to ensure file is zero byte extended
             let file_contents = std::fs::read(&tmp).expect("read from file");
@@ -536,19 +530,17 @@ mod tests {
             const NEW_LEN: u64 = 0x80;
             let (_dir, tmp, file) = new_tmp();
 
-            unsafe {
-                assert!(file.extend(NEW_LEN).is_ok());
-                assert_eq!(file.len(), NEW_LEN + LEN as u64);
+            assert!(file.extend(NEW_LEN).is_ok());
+            assert_eq!(file.len(), NEW_LEN + LEN as u64);
 
-                // allow sync thread to run and persist
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                drop(file);
+            // allow sync thread to run and persist
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(file);
 
-                match OsFile::open(tmp, MODE) {
-                    Err(e) => panic!("{e}"),
-                    Ok(file) => {
-                        assert_eq!(file.len(), NEW_LEN + LEN as u64);
-                    }
+            match OsFile::open(tmp, MODE) {
+                Err(e) => panic!("{e}"),
+                Ok(file) => {
+                    assert_eq!(file.len(), NEW_LEN + LEN as u64);
                 }
             }
         }
@@ -561,26 +553,22 @@ mod tests {
         fn lock_unlock_cycle() {
             let (_dir, tmp, file) = new_tmp();
 
-            unsafe {
-                let l1 = file.lock().expect("obtain file lock");
-                drop(l1);
+            let l1 = file.lock().expect("obtain file lock");
+            drop(l1);
 
-                let l2 = file.lock().expect("obtain file lock");
-                drop(l2);
-            }
+            let l2 = file.lock().expect("obtain file lock");
+            drop(l2);
         }
 
         #[test]
         fn io_op_with_lock_on() {
             let (_dir, tmp, file) = new_tmp();
 
-            unsafe {
-                let _l1 = file.lock().expect("obtain file lock");
-                let data = vec![1u8; 0x20];
+            let _l1 = file.lock().expect("obtain file lock");
+            let data = vec![1u8; 0x20];
 
-                file.extend(data.len() as u64).expect("resize file");
-                file.write_single(data.as_ptr(), 0, data.len()).expect("write to file");
-            }
+            file.extend(data.len() as u64).expect("resize file");
+            file.write_single(data.as_ptr(), 0, data.len()).expect("write to file");
         }
     }
 
@@ -594,12 +582,10 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
             let mut buf = vec![0u8; LEN];
 
-            unsafe {
-                assert!(file.write_single(DATA.as_ptr(), 0, LEN).is_ok());
+            assert!(file.write_single(DATA.as_ptr(), 0, LEN).is_ok());
 
-                assert!(file.read(buf.as_mut_ptr(), 0, LEN).is_ok());
-                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
-            }
+            assert!(file.read(buf.as_mut_ptr(), 0, LEN).is_ok());
+            assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
         }
 
         #[test]
@@ -611,16 +597,14 @@ mod tests {
             let total_len = ptrs.len() * LEN;
             let mut buf = vec![0u8; total_len];
 
-            unsafe {
-                file.extend(total_len as u64).expect("resize file");
-                assert!(file.write_multi(&ptrs, 0, LEN).is_ok());
+            file.extend(total_len as u64).expect("resize file");
+            assert!(file.write_multi(&ptrs, 0, LEN).is_ok());
 
-                assert!(file.read(buf.as_mut_ptr(), 0, total_len).is_ok(), "read failed");
-                assert_eq!(buf.len(), total_len, "mismatch between read and write");
+            assert!(file.read(buf.as_mut_ptr(), 0, total_len).is_ok(), "read failed");
+            assert_eq!(buf.len(), total_len, "mismatch between read and write");
 
-                for chunk in buf.chunks_exact(LEN) {
-                    assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
-                }
+            for chunk in buf.chunks_exact(LEN) {
+                assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
             }
         }
 
@@ -630,7 +614,7 @@ mod tests {
             let (_dir, tmp, file) = new_tmp();
 
             // create + write + sync + close
-            unsafe {
+            {
                 file.extend(LEN as u64).expect("resize file");
                 assert!(file.write_single(DATA.as_ptr(), 0, LEN).is_ok());
 
@@ -639,13 +623,103 @@ mod tests {
             }
 
             // open + read + verify
-            unsafe {
+            {
                 let mut buf = vec![0u8; LEN];
                 let file = OsFile::open(tmp, MODE).expect("open file");
 
                 assert!(file.read(buf.as_mut_ptr(), 0, LEN).is_ok());
                 assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
             }
+        }
+    }
+
+    mod concurrency {
+        use super::*;
+
+        #[test]
+        fn concurrent_writes_then_read() {
+            const THREADS: usize = 8;
+            const CHUNK: usize = 0x100;
+
+            let (_dir, _tmp, file) = new_tmp();
+            let file = Arc::new(file);
+
+            // required len
+            file.extend((THREADS * CHUNK) as u64).expect("extend");
+
+            let mut handles = Vec::new();
+            for i in 0..THREADS {
+                let f = file.clone();
+                handles.push(std::thread::spawn(move || {
+                    let data = vec![i as u8; CHUNK];
+                    f.write_single(data.as_ptr(), i * CHUNK, CHUNK).expect("write");
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+
+            //
+            // read back (sanity check)
+            //
+
+            let mut read_buf = vec![0u8; THREADS * CHUNK];
+            assert!(file.read(read_buf.as_mut_ptr(), 0, read_buf.len()).is_ok());
+
+            for i in 0..THREADS {
+                let chunk = &read_buf[i * CHUNK..(i + 1) * CHUNK];
+                assert!(chunk.iter().all(|b| *b == i as u8));
+            }
+        }
+
+        #[test]
+        fn concurrent_writes_with_lock() {
+            const THREADS: usize = 4;
+            const LEN: usize = 0x80;
+
+            let (_dir, _tmp, file) = new_tmp();
+            let file = Arc::new(file);
+
+            file.extend(LEN as u64).expect("extend");
+
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let f = file.clone();
+                handles.push(std::thread::spawn(move || {
+                    let _guard = f.lock().expect("lock");
+                    let data = vec![0xAB; LEN];
+                    assert!(f.write_single(data.as_ptr(), 0, LEN).is_ok());
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+        }
+    }
+
+    mod sync_tx {
+        use super::*;
+
+        #[test]
+        fn background_sync_persists_data() {
+            let (_dir, tmp, file) = new_tmp();
+            let data = vec![0xCD; LEN];
+
+            file.extend(LEN as u64).expect("extend");
+            file.write_single(data.as_ptr(), 0, LEN).expect("write");
+
+            // allow background flusher to run
+            std::thread::sleep(FLUSH_DURATION + FLUSH_DURATION);
+            drop(file);
+
+            // reopen and verify persistence
+            let mut buf = vec![0u8; LEN];
+            let file = OsFile::open(tmp, MODE).expect("reopen");
+
+            assert!(file.read(buf.as_mut_ptr(), 0, LEN).is_ok());
+            assert_eq!(buf, data);
         }
     }
 }

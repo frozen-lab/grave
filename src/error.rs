@@ -35,6 +35,14 @@ impl GraveError {
             cntx: error.to_string(),
         })
     }
+
+    #[inline]
+    pub(crate) fn poison_err<T, R>(code: ErrorCode, error: std::sync::PoisonError<T>) -> GraveResult<R> {
+        Err(Self {
+            code,
+            cntx: error.to_string(),
+        })
+    }
 }
 
 impl std::fmt::Display for GraveError {
