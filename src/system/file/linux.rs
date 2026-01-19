@@ -93,8 +93,9 @@ impl LinuxFile {
         // sanity check (debug_only)
         self.sanity_check();
 
+        // only for EIO errors
         const MAX_RETRIES: usize = 4;
-        let mut retries = 0; // only for EIO errors
+        let mut retries = 0;
 
         loop {
             if likely(fdatasync(self.fd() as c_int) == 0) {
@@ -536,7 +537,7 @@ unsafe fn open_with_flags(path: &std::path::PathBuf, mut flags: i32) -> GraveRes
             return GraveError::io_err(ErrorCode::IONsp, err);
         }
 
-        // no space available on disk
+        // path is a dir (hcf)
         if err_raw == Some(EISDIR) {
             return GraveError::io_err(ErrorCode::IOHcf, err);
         }

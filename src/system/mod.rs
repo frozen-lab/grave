@@ -1,4 +1,5 @@
 mod file;
+mod mmap;
 
 #[cfg(not(test))]
 pub(in crate::system) const FLUSH_DURATION: std::time::Duration = std::time::Duration::from_secs(1);

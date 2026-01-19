@@ -37,6 +37,14 @@ impl GraveError {
     }
 
     #[inline]
+    pub(crate) fn map_err<R>(code: ErrorCode, error: std::io::Error) -> GraveResult<R> {
+        Err(Self {
+            code,
+            cntx: error.to_string(),
+        })
+    }
+
+    #[inline]
     pub(crate) fn poison_err<T, R>(code: ErrorCode, error: std::sync::PoisonError<T>) -> GraveResult<R> {
         Err(Self {
             code,
@@ -47,7 +55,7 @@ impl GraveError {
 
 impl std::fmt::Display for GraveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GraveError {{code: {}, context: {}}}", self.code as u16, self.cntx)
+        write!(f, "GraveError {{code: {}, context: {}}}", self.code(), self.context())
     }
 }
 
@@ -72,6 +80,15 @@ pub(crate) enum ErrorCode {
     IOEof = 0x204,
     /// (517) syncing error
     IOSyn = 0x205,
+
+    /// (1024) internal fuck up
+    MMHcf = 0x400,
+    /// (1025) unknown IO error (fallback)
+    MMUnk = 0x401,
+    /// (1026) no more memory available
+    MMNsp = 0x402,
+    /// (1027) syncing error
+    MMSyn = 0x403,
 
     /// (768) unknown thread error
     MTUnk = 0x300,
@@ -105,6 +122,11 @@ impl ErrorCode {
             0x203 => ErrorCode::IOLck,
             0x204 => ErrorCode::IOEof,
             0x205 => ErrorCode::IOSyn,
+
+            0x400 => ErrorCode::MMHcf,
+            0x401 => ErrorCode::MMUnk,
+            0x402 => ErrorCode::MMNsp,
+            0x403 => ErrorCode::MMSyn,
 
             0x300 => ErrorCode::MTUnk,
             0x301 => ErrorCode::MTMpn,
