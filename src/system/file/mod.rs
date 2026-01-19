@@ -2,7 +2,11 @@
 mod linux;
 
 use super::{IOFlushMode, FLUSH_DURATION};
-use crate::{error::ErrorCode, GraveError, GraveResult};
+use crate::{
+    error::ErrorCode,
+    hints::{likely, unlikely},
+    GraveError, GraveResult,
+};
 use std::{
     cell::UnsafeCell,
     mem::ManuallyDrop,
@@ -24,19 +28,27 @@ unsafe impl Send for OsFile {}
 unsafe impl Sync for OsFile {}
 
 impl OsFile {
-    pub(crate) fn new(path: std::path::PathBuf, mode: IOFlushMode) -> GraveResult<Self> {
+    pub(crate) fn new(path: std::path::PathBuf, mode: IOFlushMode, init_len: u64) -> GraveResult<Self> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::LinuxFile::new(path) }?;
-
         let core = InternalFile::new(file, mode.clone());
+        let slf = Self { core: core.clone() };
+
+        // init_len
+        slf.extend(init_len).map_err(|e| {
+            // clear up so the new_init could work well
+            slf.delete();
+            e
+        })?;
+
         if mode == IOFlushMode::Background {
-            InternalFile::spawn_tx(core.clone())?;
+            InternalFile::spawn_tx(core)?;
         }
 
-        Ok(Self { core })
+        Ok(slf)
     }
 
     pub(crate) fn open(path: std::path::PathBuf, mode: IOFlushMode) -> GraveResult<Self> {
@@ -67,17 +79,24 @@ impl OsFile {
 
     #[inline]
     pub(crate) fn extend(&self, len_to_add: u64) -> GraveResult<()> {
+        // sanity check
+        self.sanity_check()?;
+
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        unsafe {
-            self.get_file().extend(len_to_add)
-        }
+        unsafe { self.get_file().extend(len_to_add) }?;
+
+        self.core.dirty.store(true, atomic::Ordering::Release);
+        Ok(())
     }
 
     #[inline]
     pub(crate) fn sync(&self) -> GraveResult<()> {
+        // sanity check
+        self.sanity_check()?;
+
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
@@ -89,29 +108,87 @@ impl OsFile {
 
     #[inline]
     pub(crate) fn lock(&self) -> GraveResult<OsFileLockGuard<'_>> {
+        // sanity check
+        self.sanity_check()?;
+
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
-        unsafe {
-            self.get_file().lock()?;
-            Ok(OsFileLockGuard(self))
-        }
+        unsafe { self.get_file().lock() }?;
+
+        Ok(OsFileLockGuard(self))
     }
 
     #[inline]
     pub(crate) fn delete(&self) -> GraveResult<()> {
+        // NOTE: sanity check is invalid here, cause we are deleting the file, hence we don't
+        // actually care if the state is sane or not ;)
+
+        // mark file as close
+        self.core.closed.store(true, atomic::Ordering::Release);
+
+        // close flusher thread
+        if self.core.mode == IOFlushMode::Background {
+            self.core.cv.notify_one();
+        }
+
+        let file = self.get_file();
+
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
         #[cfg(target_os = "linux")]
         unsafe {
-            let file = self.get_file();
             match file.close() {
                 Ok(_) => file.unlink(),
                 Err(e) => Err(e),
             }
         }
+    }
+
+    #[inline]
+    pub(crate) fn read(&self, buf_ptr: *mut u8, offset: usize, len_to_read: usize) -> GraveResult<()> {
+        // sanity check
+        self.sanity_check()?;
+
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            self.get_file().pread(buf_ptr, offset, len_to_read)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn write_single(&self, buf_ptr: *const u8, offset: usize, len_to_write: usize) -> GraveResult<()> {
+        // sanity check
+        self.sanity_check()?;
+
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe { self.get_file().pwrite(buf_ptr, offset, len_to_write) }?;
+
+        self.core.dirty.store(true, atomic::Ordering::Release);
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn write_multi(&self, buf_ptrs: &[*const u8], offset: usize, buffer_size: usize) -> GraveResult<()> {
+        // sanity check
+        self.sanity_check()?;
+
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe { self.get_file().pwritev(buf_ptrs, offset, buffer_size) }?;
+
+        self.core.dirty.store(true, atomic::Ordering::Release);
+        Ok(())
     }
 
     fn close(&self) -> GraveResult<()> {
@@ -134,6 +211,18 @@ impl OsFile {
         }
     }
 
+    #[inline(always)]
+    fn sanity_check(&self) -> GraveResult<()> {
+        if likely(!self.core.errored.load(atomic::Ordering::Acquire)) {
+            return Ok(());
+        }
+
+        let raw = self.core.err_code.load(atomic::Ordering::Acquire);
+        let code = ErrorCode::from_u16(raw);
+
+        Err(GraveError::new(code, "OsFile is in errored state".into()))
+    }
+
     #[cfg(target_os = "linux")]
     #[inline]
     fn get_file(&self) -> &ManuallyDrop<linux::LinuxFile> {
@@ -143,9 +232,10 @@ impl OsFile {
 
 impl Drop for OsFile {
     fn drop(&mut self) {
+        self.core.closed.store(true, atomic::Ordering::Release);
+
         // close flusher thread
         if self.core.mode == IOFlushMode::Background {
-            self.core.closed.store(true, atomic::Ordering::Release);
             self.core.cv.notify_one();
         }
 
@@ -189,6 +279,7 @@ struct InternalFile {
     dirty: atomic::AtomicBool,
     closed: atomic::AtomicBool,
     errored: atomic::AtomicBool,
+    err_code: atomic::AtomicU16,
     file: UnsafeCell<ManuallyDrop<TFile>>,
 }
 
@@ -200,6 +291,7 @@ impl InternalFile {
             cv: Condvar::new(),
             lock: Mutex::new(()),
             version: atomic::AtomicU8::new(0),
+            err_code: atomic::AtomicU16::new(0),
             dirty: atomic::AtomicBool::new(false),
             closed: atomic::AtomicBool::new(false),
             errored: atomic::AtomicBool::new(false),
@@ -257,6 +349,7 @@ impl InternalFile {
             guard = match core.cv.wait_timeout(guard, FLUSH_DURATION) {
                 Ok((g, _)) => g,
                 Err(_) => {
+                    core.err_code.store(ErrorCode::MTTpn as u16, atomic::Ordering::Release);
                     core.errored.store(true, atomic::Ordering::Release);
                     return;
                 }
@@ -265,7 +358,13 @@ impl InternalFile {
             if core.dirty.swap(false, atomic::Ordering::AcqRel) {
                 drop(guard);
 
+                // protection against delete
+                if core.closed.load(atomic::Ordering::Acquire) {
+                    return;
+                }
+
                 if unsafe { (&*core.file.get()).sync() }.is_err() {
+                    core.err_code.store(ErrorCode::IOSyn as u16, atomic::Ordering::Release);
                     core.errored.store(true, atomic::Ordering::Release);
                     return;
                 }
@@ -295,5 +394,305 @@ impl<'a> Drop for OsFileLockGuard<'a> {
     fn drop(&mut self) {
         // NOTE: We silently consume the error, as we can't panic in Drop ^_~
         let _ = self.0.unlock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::{tempdir, TempDir};
+
+    const LEN: usize = 0x20;
+    const MODE: IOFlushMode = IOFlushMode::Background;
+
+    fn new_tmp() -> (TempDir, PathBuf, OsFile) {
+        let dir = tempdir().expect("temp dir");
+        let tmp = dir.path().join("tmp_file");
+        let file = unsafe { OsFile::new(tmp.clone(), MODE, LEN as u64) }.expect("new OsFile");
+
+        (dir, tmp, file)
+    }
+
+    mod new_open {
+        use super::*;
+
+        #[test]
+        fn new_works() {
+            let (_dir, tmp, file) = new_tmp();
+            assert!(file.fd() >= 0);
+            assert!(!file.core.closed.load(atomic::Ordering::Acquire));
+            assert!(!file.core.errored.load(atomic::Ordering::Acquire));
+
+            // sanity check
+            assert!(tmp.exists());
+        }
+
+        #[test]
+        fn open_works() {
+            let (_dir, tmp, file) = new_tmp();
+            unsafe {
+                assert!(file.fd() >= 0);
+                assert!(!file.core.closed.load(atomic::Ordering::Acquire));
+                assert!(!file.core.errored.load(atomic::Ordering::Acquire));
+                drop(file);
+
+                match OsFile::open(tmp, MODE) {
+                    Ok(file) => {
+                        assert!(file.fd() >= 0);
+                        assert!(!file.core.closed.load(atomic::Ordering::Acquire));
+                        assert!(!file.core.errored.load(atomic::Ordering::Acquire));
+                    }
+                    Err(e) => panic!("failed to open file due to E: {e}"),
+                }
+            }
+        }
+
+        #[test]
+        fn open_fails_when_file_is_deleted() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.fd() >= 0);
+                assert!(file.delete().is_ok());
+
+                let file = OsFile::open(tmp, MODE);
+                assert!(file.is_err());
+            }
+        }
+    }
+
+    mod close {
+        use super::*;
+
+        #[test]
+        fn close_works() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close().is_ok());
+
+                // sanity check
+                assert!(tmp.exists());
+            }
+        }
+
+        #[test]
+        fn close_after_close_does_not_fail() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                // should never fail
+                assert!(file.close().is_ok());
+                assert!(file.close().is_ok());
+                assert!(file.close().is_ok());
+
+                // sanity check
+                assert!(tmp.exists());
+            }
+
+            // NOTE: We need this protection, cause in multithreaded env's, more then one thread
+            // could try to close the file at same time, hence the system should not panic in these cases
+        }
+    }
+
+    mod delete {
+        use super::*;
+
+        #[test]
+        fn delete_works_on_open_file() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.delete().is_ok());
+
+                // sanity checks
+                assert!(!tmp.exists());
+                assert!(file.core.closed.load(atomic::Ordering::Acquire));
+            }
+        }
+
+        #[test]
+        fn delete_works_on_closed_file() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.close().is_ok());
+                assert!(file.delete().is_ok());
+
+                // sanity checks
+                assert!(file.core.closed.load(atomic::Ordering::Acquire));
+                assert!(!tmp.exists());
+            }
+        }
+
+        #[test]
+        fn deleting_osfile_works() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.delete().is_ok());
+
+                // sanity checks
+                assert!(file.core.closed.load(atomic::Ordering::Acquire));
+                assert!(!tmp.exists());
+            }
+        }
+
+        #[test]
+        fn delete_fails_on_deleted_file() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.delete().is_ok());
+
+                // sanity checks
+                assert!(file.core.closed.load(atomic::Ordering::Acquire));
+                assert!(!tmp.exists());
+
+                // should fail on missing
+                assert!(file.delete().is_err());
+            }
+        }
+    }
+
+    mod extend {
+        use super::*;
+
+        #[test]
+        fn extend_zero_extends_file() {
+            const NEW_LEN: u64 = 0x80;
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.extend(NEW_LEN).is_ok());
+                assert_eq!(file.len(), NEW_LEN + LEN as u64);
+                assert!(file.close().is_ok());
+            }
+
+            // strict sanity check to ensure file is zero byte extended
+            let file_contents = std::fs::read(&tmp).expect("read from file");
+            assert_eq!(file_contents.len(), NEW_LEN as usize + LEN, "len mismatch for file");
+            assert!(
+                file_contents.iter().all(|b| *b == 0u8),
+                "file must be zero byte extended"
+            );
+        }
+
+        #[test]
+        fn open_preserves_existing_length() {
+            const NEW_LEN: u64 = 0x80;
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.extend(NEW_LEN).is_ok());
+                assert_eq!(file.len(), NEW_LEN + LEN as u64);
+                assert!(file.sync().is_ok());
+                assert!(file.close().is_ok());
+
+                match OsFile::open(tmp, MODE) {
+                    Err(e) => panic!("{e}"),
+                    Ok(file) => {
+                        assert_eq!(file.len(), NEW_LEN + LEN as u64);
+                    }
+                }
+            }
+        }
+    }
+
+    mod lock_unlock {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[test]
+        fn lock_unlock_cycle() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                let l1 = file.lock().expect("obtain file lock");
+                drop(l1);
+
+                let l2 = file.lock().expect("obtain file lock");
+                drop(l2);
+            }
+        }
+
+        #[test]
+        fn io_op_with_lock_on() {
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                let _l1 = file.lock().expect("obtain file lock");
+                let data = vec![1u8; 0x20];
+
+                file.extend(data.len() as u64).expect("resize file");
+                file.write_single(data.as_ptr(), 0, data.len()).expect("write to file");
+            }
+        }
+    }
+
+    mod write_read {
+        use super::*;
+
+        #[test]
+        fn single_write_read_cycle() {
+            const DATA: [u8; LEN] = [0x1A; LEN];
+            let (_dir, tmp, file) = new_tmp();
+
+            unsafe {
+                assert!(file.write_single(DATA.as_ptr(), 0, LEN).is_ok());
+
+                let mut buf = vec![0u8; LEN];
+                assert!(file.read(buf.as_mut_ptr(), 0, LEN).is_ok());
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+            }
+        }
+
+        #[test]
+        fn multi_write_read_cycle() {
+            const DATA: [u8; LEN] = [0x1A; LEN];
+            let (_dir, tmp, file) = new_tmp();
+
+            let ptrs = vec![DATA.as_ptr(); 0x10];
+            let total_len = ptrs.len() * LEN;
+
+            unsafe {
+                file.extend(total_len as u64).expect("resize file");
+                assert!(file.write_multi(&ptrs, 0, LEN).is_ok());
+
+                let mut buf = vec![0u8; total_len];
+                assert!(file.read(buf.as_mut_ptr(), 0, total_len).is_ok(), "read failed");
+                assert_eq!(buf.len(), total_len, "mismatch between read and write");
+
+                for chunk in buf.chunks_exact(LEN) {
+                    assert_eq!(chunk, DATA, "data mismatch in pwritev readback");
+                }
+            }
+        }
+
+        #[test]
+        fn single_write_read_cycle_across_sessions() {
+            const DATA: [u8; LEN] = [0x1A; LEN];
+            let (_dir, tmp, file) = new_tmp();
+
+            // create + write + sync + close
+            unsafe {
+                file.extend(LEN as u64).expect("resize file");
+                assert!(file.write_single(DATA.as_ptr(), 0, LEN).is_ok());
+
+                // allow sync thread to run and persist
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            // open + read + verify
+            unsafe {
+                let file = OsFile::open(tmp, MODE).expect("open file");
+
+                let mut buf = vec![0u8; LEN];
+                assert!(file.read(buf.as_mut_ptr(), 0, LEN).is_ok());
+                assert_eq!(DATA.to_vec(), buf, "mismatch between read and write");
+                assert!(file.close().is_ok());
+            }
+        }
     }
 }

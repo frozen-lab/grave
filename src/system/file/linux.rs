@@ -5,9 +5,9 @@ use crate::{
 };
 use libc::{
     c_int, c_short, c_void, close, fcntl, fdatasync, flock, fstat, ftruncate, iovec, off_t, open, pread, pwrite,
-    pwritev, size_t, stat, sysconf, unlink, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOSPC, EPERM, EROFS,
-    ESPIPE, F_SETLKW, F_UNLCK, F_WRLCK, O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, SEEK_SET, S_IRUSR, S_IWUSR,
-    _SC_IOV_MAX,
+    pwritev, size_t, stat, sysconf, unlink, EACCES, EBADF, EDQUOT, EFAULT, EINVAL, EIO, EISDIR, EMSGSIZE, ENOSPC,
+    EPERM, EROFS, ESPIPE, F_SETLKW, F_UNLCK, F_WRLCK, O_CLOEXEC, O_CREAT, O_NOATIME, O_RDWR, O_TRUNC, SEEK_SET,
+    S_IRUSR, S_IWUSR, _SC_IOV_MAX,
 };
 use std::{
     ffi::CString,
@@ -252,6 +252,11 @@ impl LinuxFile {
                 // unexpected EOF
                 if unlikely(res == 0) {
                     return GraveError::io_err(ErrorCode::IOEof, error);
+                }
+
+                // permission denied
+                if unlikely(error_raw == Some(EACCES) || error_raw == Some(EPERM)) {
+                    return GraveError::io_err(ErrorCode::PMRed, error);
                 }
 
                 // invalid fd, invalid fd type, bad pointer, etc.
