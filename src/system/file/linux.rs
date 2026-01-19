@@ -933,4 +933,14 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn sync_works() {
+        let (_dir, tmp, file) = new_tmp();
+
+        unsafe {
+            assert!(file.sync().is_ok());
+            assert!(file.close().is_ok());
+        }
+    }
 }
