@@ -2,15 +2,11 @@
 mod linux;
 
 use super::{IOFlushMode, FLUSH_DURATION};
-use crate::{
-    error::ErrorCode,
-    hints::{likely, unlikely},
-    GraveError, GraveResult,
-};
+use crate::{error::ErrorCode, hints::likely, GraveError, GraveResult};
 use std::{
     cell::UnsafeCell,
     mem::ManuallyDrop,
-    sync::{atomic, mpsc, Arc, Condvar, Mutex, MutexGuard},
+    sync::{atomic, mpsc, Arc, Condvar, Mutex},
 };
 
 #[cfg(target_os = "linux")]
@@ -34,13 +30,14 @@ impl OsFile {
 
         #[cfg(target_os = "linux")]
         let file = unsafe { linux::LinuxFile::new(path) }?;
+
         let core = InternalFile::new(file, mode.clone());
         let slf = Self { core: core.clone() };
 
         // init_len
         slf.extend(init_len).map_err(|e| {
             // clear up so the new_init could work well
-            slf.delete();
+            let _ = slf.delete();
             e
         })?;
 
@@ -96,14 +93,7 @@ impl OsFile {
     pub(crate) fn sync(&self) -> GraveResult<()> {
         // sanity check
         self.sanity_check()?;
-
-        #[cfg(not(target_os = "linux"))]
-        unimplemented!();
-
-        #[cfg(target_os = "linux")]
-        unsafe {
-            self.get_file().sync()
-        }
+        self.core.sync()
     }
 
     #[inline]
@@ -179,6 +169,7 @@ impl OsFile {
         unsafe { self.get_file().pwrite(buf_ptr, offset, len_to_write) }?;
 
         self.core.dirty.store(true, atomic::Ordering::Release);
+        self.core.cv.notify_one();
         Ok(())
     }
 
@@ -194,6 +185,7 @@ impl OsFile {
         unsafe { self.get_file().pwritev(buf_ptrs, offset, buffer_size) }?;
 
         self.core.dirty.store(true, atomic::Ordering::Release);
+        self.core.cv.notify_one();
         Ok(())
     }
 
@@ -207,7 +199,7 @@ impl OsFile {
     ///
     /// - When deleting the file
     /// - When dropping the file
-    fn _close(&self) -> GraveResult<()> {
+    fn close(&self) -> GraveResult<()> {
         #[cfg(not(target_os = "linux"))]
         unimplemented!();
 
@@ -239,10 +231,9 @@ impl OsFile {
         Err(GraveError::new(code, "OsFile is in errored state".into()))
     }
 
-    #[cfg(target_os = "linux")]
     #[inline]
-    fn get_file(&self) -> &ManuallyDrop<linux::LinuxFile> {
-        unsafe { (&*self.core.file.get()) }
+    fn get_file(&self) -> &ManuallyDrop<TFile> {
+        unsafe { &*self.core.file.get() }
     }
 }
 
@@ -262,7 +253,7 @@ impl Drop for OsFile {
             let _ = self.sync();
         }
 
-        let _ = self._close();
+        let _ = self.close();
     }
 }
 
@@ -301,10 +292,13 @@ struct InternalFile {
     file: UnsafeCell<ManuallyDrop<TFile>>,
 }
 
+unsafe impl Send for InternalFile {}
+unsafe impl Sync for InternalFile {}
+
 impl InternalFile {
     #[cfg(target_os = "linux")]
     fn new(file: TFile, mode: IOFlushMode) -> Arc<Self> {
-        let core = InternalFile {
+        let core = Self {
             mode: mode.clone(),
             cv: Condvar::new(),
             lock: Mutex::new(()),
@@ -319,6 +313,17 @@ impl InternalFile {
         Arc::new(core)
     }
 
+    #[inline]
+    fn sync(&self) -> GraveResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        unimplemented!();
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            (&*self.file.get()).sync()
+        }
+    }
+
     fn spawn_tx(core: Arc<Self>) -> GraveResult<()> {
         let (tx, rx) = mpsc::sync_channel::<GraveResult<()>>(1);
 
@@ -327,7 +332,7 @@ impl InternalFile {
             .spawn(move || Self::tx_thread(core, tx))
             .map_err(|_| GraveError::new(ErrorCode::MTMpn, "grave tx thread spawn failed for OsFile".into()))?;
 
-        rx.recv().map_err(|_| {
+        let _ = rx.recv().map_err(|_| {
             GraveError::new(
                 ErrorCode::MTUnk,
                 "grave tx thread died before init could be completed for OsFile".into(),
@@ -376,7 +381,7 @@ impl InternalFile {
             if core.dirty.swap(false, atomic::Ordering::AcqRel) {
                 drop(guard);
 
-                if unsafe { (&*core.file.get()).sync() }.is_err() {
+                if core.sync().is_err() {
                     core.err_code.store(ErrorCode::IOSyn as u16, atomic::Ordering::Release);
                     core.errored.store(true, atomic::Ordering::Release);
                     return;
@@ -393,9 +398,6 @@ impl InternalFile {
         }
     }
 }
-
-unsafe impl Send for InternalFile {}
-unsafe impl Sync for InternalFile {}
 
 //
 // RAII safe lock guard
@@ -551,7 +553,7 @@ mod tests {
 
         #[test]
         fn lock_unlock_cycle() {
-            let (_dir, tmp, file) = new_tmp();
+            let (_dir, _tmp, file) = new_tmp();
 
             let l1 = file.lock().expect("obtain file lock");
             drop(l1);
@@ -562,7 +564,7 @@ mod tests {
 
         #[test]
         fn io_op_with_lock_on() {
-            let (_dir, tmp, file) = new_tmp();
+            let (_dir, _tmp, file) = new_tmp();
 
             let _l1 = file.lock().expect("obtain file lock");
             let data = vec![1u8; 0x20];
@@ -579,7 +581,7 @@ mod tests {
         fn single_write_read_cycle() {
             const DATA: [u8; LEN] = [0x1A; LEN];
 
-            let (_dir, tmp, file) = new_tmp();
+            let (_dir, _tmp, file) = new_tmp();
             let mut buf = vec![0u8; LEN];
 
             assert!(file.write_single(DATA.as_ptr(), 0, LEN).is_ok());
@@ -591,7 +593,7 @@ mod tests {
         #[test]
         fn multi_write_read_cycle() {
             const DATA: [u8; LEN] = [0x1A; LEN];
-            let (_dir, tmp, file) = new_tmp();
+            let (_dir, _tmp, file) = new_tmp();
 
             let ptrs = vec![DATA.as_ptr(); 0x10];
             let total_len = ptrs.len() * LEN;
