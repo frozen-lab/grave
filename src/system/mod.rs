@@ -1,6 +1,13 @@
 mod file;
 mod mmap;
 
+pub(crate) use file::OsFile;
+pub(crate) use mmap::OsMMap;
+
+//
+// Flush mode
+//
+
 #[cfg(not(test))]
 pub(in crate::system) const FLUSH_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -8,7 +15,7 @@ pub(in crate::system) const FLUSH_DURATION: std::time::Duration = std::time::Dur
 pub(in crate::system) const FLUSH_DURATION: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq)]
-pub(in crate::system) enum IOFlushMode {
+pub(crate) enum IOFlushMode {
     Manual,
     Background,
 }

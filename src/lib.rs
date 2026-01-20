@@ -10,6 +10,9 @@ mod error;
 mod hints;
 
 #[allow(unused)]
+mod pool;
+
+#[allow(unused)]
 mod system;
 
 pub use error::{GraveError, GraveResult};
