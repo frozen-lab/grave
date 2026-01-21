@@ -63,10 +63,122 @@ impl BufPool {
             head: AtomicU64::new(pack_pool_idx(0, 0)),
         }
     }
+
+    /// Allocates `N` buffers for use in write IO ops.
+    ///
+    /// ## Polling
+    ///
+    /// This function may not allocate all the `N` required buffers in one call,
+    /// so the caller must poll (wait and retry) for remaining `N` buffers.
+    #[inline(always)]
+    pub(crate) fn allocate(&self, n: usize) -> Allocation {
+        let mut batch = Allocation::new(self, n);
+        let mut head = self.head.load(Ordering::Acquire);
+
+        loop {
+            let (idx, tag) = unpack_pool_idx(head);
+
+            // NOTE: If we reach the last entry (i.e. invalid ptr), we return early, despite not
+            // allocating all the required buffers
+            //
+            // This allows caller to process allocated buffers, and avoid busy waiting for
+            // more buffers
+            //
+            // The caller should pool to allocate, till all the required buffers are allocated
+            if idx == INVALID_POOL_SLOT {
+                return batch;
+            }
+
+            // local walk
+            let mut cur = idx;
+            let mut last = cur;
+            let mut count = 1;
+            while count < n {
+                // This is valid as `next` is already the index (unpacked version) of the slot
+                let next = self.next[last as usize].load(Ordering::Relaxed);
+                if next == INVALID_POOL_SLOT {
+                    break;
+                }
+
+                last = next;
+                count += 1;
+            }
+
+            let new_head_idx = self.next[last as usize].load(Ordering::Relaxed);
+            let new_head = pack_pool_idx(new_head_idx, 1 + tag);
+
+            match self
+                .head
+                .compare_exchange(head, new_head, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    // materialize slots
+                    let mut cur = idx;
+                    for _ in 0..count {
+                        batch.slots.push(self.ptr.add(cur * self.size));
+                        cur = self.next[cur as usize].load(Ordering::Relaxed);
+                    }
+                    batch.count = count;
+                    return batch;
+                }
+                Err(h) => head = h,
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn free(&self, ptr: &PoolPtr) {
+        let offset = self.ptr.offset_from(&ptr);
+        let idx = offset as u64 / self.size;
+
+        // sanity check
+        debug_assert!(idx < self.cap, "slot index is out of bounds");
+
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            let (head_idx, head_tag) = unpack_pool_idx(head);
+            self.next[idx as usize].store(head_idx, Ordering::Relaxed);
+            let new = pack_pool_idx(idx, head_tag);
+
+            match self
+                .head
+                .compare_exchange(head, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return,
+                Err(h) => head = h,
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for BufPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut free_slots = 0;
+        let mut head = self.head.load(Ordering::Acquire);
+        while head != INVALID_POOL_SLOT {
+            head = self.next[head as usize].load(Ordering::Relaxed);
+            free_slots += 1;
+        }
+
+        write!(
+            f,
+            "BufPool {{ cap: {}, size: {}, free_slots: {} }}",
+            self.cap, self.size, free_slots
+        )
+    }
 }
 
 impl Drop for BufPool {
     fn drop(&mut self) {
+        let mut guard = match self.lock.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        while self.active.load(Ordering::Acquire) != 0 {
+            guard = self.shutdown_cdvr.wait(guard).expect("shutdown cv poisoned");
+        }
+
         let pool_size = (self.cap * self.size) as usize;
 
         // NOTE: We re-construct original allocation from the stored pointer! This builds up the vecotor
@@ -98,15 +210,15 @@ const fn unpack_pool_idx(v: u64) -> (u64, u64) {
 
 type TSlot = *mut u8;
 
-#[derive(Debug)]
-struct PoolPtr(TSlot);
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct PoolPtr(TSlot);
 
 unsafe impl Send for PoolPtr {}
 unsafe impl Sync for PoolPtr {}
 
 impl PoolPtr {
     #[inline]
-    const fn ptr(&self) -> TSlot {
+    pub(crate) const fn ptr(&self) -> TSlot {
         self.0
     }
 
@@ -116,8 +228,8 @@ impl PoolPtr {
     }
 
     #[inline]
-    const fn offset_from(&self, ptr: &Self) -> usize {
-        unsafe { ptr.0.offset_from(self.0) as usize }
+    const fn offset_from(&self, ptr: &Self) -> u64 {
+        unsafe { ptr.0.offset_from(self.0) as u64 }
     }
 }
 
@@ -126,17 +238,45 @@ impl PoolPtr {
 //
 
 #[derive(Debug)]
-pub(crate) struct Allocation {
+pub(crate) struct Allocation<'a> {
     pub(crate) count: usize,
-    pub(crate) slots: Vec<TSlot>,
+    pub(crate) slots: Vec<PoolPtr>,
+    guard: AllocationGuard<'a>,
 }
 
-impl Allocation {
+impl<'a> Allocation<'a> {
     #[inline]
-    fn new(cap: usize) -> Self {
+    fn new(pool: &'a BufPool, cap: usize) -> Self {
         Self {
             count: 0,
-            slots: Vec::<TSlot>::with_capacity(cap),
+            slots: Vec::<PoolPtr>::with_capacity(cap),
+            guard: AllocationGuard(pool),
+        }
+    }
+}
+
+impl<'a> Drop for Allocation<'a> {
+    fn drop(&mut self) {
+        self.slots.iter().map(|ptr| {
+            self.guard.0.free(ptr);
+        });
+    }
+}
+
+//
+// allocation guard
+//
+
+#[derive(Debug)]
+struct AllocationGuard<'a>(&'a BufPool);
+
+impl Drop for AllocationGuard<'_> {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::Release) == 1 {
+            // last user
+            if let Ok(_g) = self.0.lock.lock() {
+                self.0.shutdown_cdvr.notify_one();
+            }
         }
     }
 }
