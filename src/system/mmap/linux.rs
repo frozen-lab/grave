@@ -43,16 +43,16 @@ impl LinuxMMap {
                 || err_raw == Some(EACCES)
                 || err_raw == Some(EOVERFLOW)
             {
-                return GraveError::map_err(ErrorCode::MMHcf, err);
+                return GraveError::io_err(ErrorCode::MMHcf, err);
             }
 
             // no more memory space available
             if err_raw == Some(ENOMEM) {
-                return GraveError::map_err(ErrorCode::MMNsp, err);
+                return GraveError::io_err(ErrorCode::MMNsp, err);
             }
 
             // unknown (unsupported, etc.)
-            return GraveError::map_err(ErrorCode::MMUnk, err);
+            return GraveError::io_err(ErrorCode::MMUnk, err);
         }
 
         return Ok(Self {
@@ -82,11 +82,11 @@ impl LinuxMMap {
 
             // invalid or unaligned pointer
             if err_raw == Some(EINVAL) || err_raw == Some(ENOMEM) {
-                return GraveError::map_err(ErrorCode::MMHcf, err);
+                return GraveError::io_err(ErrorCode::MMHcf, err);
             }
 
             // unknown
-            return GraveError::map_err(ErrorCode::MMUnk, err);
+            return GraveError::io_err(ErrorCode::MMUnk, err);
         }
 
         Ok(())
@@ -120,7 +120,7 @@ impl LinuxMMap {
 
             // invalid fd or lack of support for sync
             if error_raw == Some(ENOMEM) || error_raw == Some(EINVAL) {
-                return GraveError::map_err(ErrorCode::MMHcf, error);
+                return GraveError::io_err(ErrorCode::MMHcf, error);
             }
 
             // locked file or fatel error, i.e. unable to sync
@@ -135,10 +135,10 @@ impl LinuxMMap {
                 }
 
                 // retries exhausted and durability is broken in the current window
-                return GraveError::map_err(ErrorCode::MMSyn, error);
+                return GraveError::io_err(ErrorCode::MMSyn, error);
             }
 
-            return GraveError::map_err(ErrorCode::MMUnk, error);
+            return GraveError::io_err(ErrorCode::MMUnk, error);
         }
     }
 

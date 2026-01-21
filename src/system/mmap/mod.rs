@@ -303,11 +303,11 @@ impl InternalMap {
         std::thread::Builder::new()
             .name("grave-osmmap-tx".into())
             .spawn(move || Self::tx_thread(core, tx))
-            .map_err(|_| GraveError::new(ErrorCode::MTMpn, "grave tx thread spawn failed for OsMMap".into()))?;
+            .map_err(|_| GraveError::new(ErrorCode::MMMpn, "grave tx thread spawn failed for OsMMap".into()))?;
 
         let _ = rx.recv().map_err(|_| {
             GraveError::new(
-                ErrorCode::MTUnk,
+                ErrorCode::MMUnk,
                 "grave tx thread died before init could be completed for OsMMap".into(),
             )
         })?;
@@ -326,7 +326,7 @@ impl InternalMap {
             }
             Err(_) => {
                 let _ = init.send(Err(GraveError::new(
-                    ErrorCode::MTMpn,
+                    ErrorCode::MMMpn,
                     "tx mutex poisoned during init".into(),
                 )));
                 return;
@@ -341,7 +341,7 @@ impl InternalMap {
             guard = match core.cv.wait_timeout(guard, FLUSH_DURATION) {
                 Ok((g, _)) => g,
                 Err(_) => {
-                    core.err_code.store(ErrorCode::MTTpn as u16, atomic::Ordering::Release);
+                    core.err_code.store(ErrorCode::MMTpn as u16, atomic::Ordering::Release);
                     core.errored.store(true, atomic::Ordering::Release);
                     return;
                 }

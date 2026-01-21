@@ -128,7 +128,7 @@ impl OsFile {
         // NOTE: we must wait for sync thread to exit to avoid use of operations using
         // invalid fd (which is after close, i.e. fd = -1)
         if let Err(e) = self.core.lock.lock() {
-            return GraveError::poison_err::<std::sync::MutexGuard<'_, _>, ()>(ErrorCode::MTMpn, e);
+            return Err(GraveError::from_poison(ErrorCode::IOMpn, e));
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -330,11 +330,11 @@ impl InternalFile {
         std::thread::Builder::new()
             .name("grave-osfile-tx".into())
             .spawn(move || Self::tx_thread(core, tx))
-            .map_err(|_| GraveError::new(ErrorCode::MTMpn, "grave tx thread spawn failed for OsFile".into()))?;
+            .map_err(|_| GraveError::new(ErrorCode::IOMpn, "grave tx thread spawn failed for OsFile".into()))?;
 
         let _ = rx.recv().map_err(|_| {
             GraveError::new(
-                ErrorCode::MTUnk,
+                ErrorCode::IOUnk,
                 "grave tx thread died before init could be completed for OsFile".into(),
             )
         })?;
@@ -353,7 +353,7 @@ impl InternalFile {
             }
             Err(_) => {
                 let _ = init.send(Err(GraveError::new(
-                    ErrorCode::MTMpn,
+                    ErrorCode::IOMpn,
                     "tx mutex poisoned during init".into(),
                 )));
                 return;
@@ -368,7 +368,7 @@ impl InternalFile {
             guard = match core.cv.wait_timeout(guard, FLUSH_DURATION) {
                 Ok((g, _)) => g,
                 Err(_) => {
-                    core.err_code.store(ErrorCode::MTTpn as u16, atomic::Ordering::Release);
+                    core.err_code.store(ErrorCode::IOTpn as u16, atomic::Ordering::Release);
                     core.errored.store(true, atomic::Ordering::Release);
                     return;
                 }

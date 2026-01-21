@@ -117,7 +117,7 @@ impl LinuxFile {
 
             // read-only file (can also be caused by TOCTOU)
             if error_raw == Some(EROFS) {
-                return GraveError::io_err(ErrorCode::PMWrt, error);
+                return GraveError::io_err(ErrorCode::IOWrt, error);
             }
 
             // fatel error, i.e. unable to sync
@@ -197,7 +197,7 @@ impl LinuxFile {
 
         // read-only fs (can also be caused by TOCTOU)
         if error_raw == Some(EROFS) {
-            return GraveError::io_err(ErrorCode::PMWrt, error);
+            return GraveError::io_err(ErrorCode::IOWrt, error);
         }
 
         // no space available on disk
@@ -257,7 +257,7 @@ impl LinuxFile {
 
                 // permission denied
                 if unlikely(error_raw == Some(EACCES) || error_raw == Some(EPERM)) {
-                    return GraveError::io_err(ErrorCode::PMRed, error);
+                    return GraveError::io_err(ErrorCode::IORed, error);
                 }
 
                 // invalid fd, invalid fd type, bad pointer, etc.
@@ -313,7 +313,7 @@ impl LinuxFile {
 
                 // read-only file (can also be caused by TOCTOU)
                 if error_raw == Some(EROFS) {
-                    return GraveError::io_err(ErrorCode::PMWrt, error);
+                    return GraveError::io_err(ErrorCode::IOWrt, error);
                 }
 
                 // invalid fd, invalid fd type, bad pointer, etc.
@@ -390,7 +390,7 @@ impl LinuxFile {
 
                 // read-only file (can also be caused by TOCTOU)
                 if error_raw == Some(EROFS) {
-                    return GraveError::io_err(ErrorCode::PMWrt, error);
+                    return GraveError::io_err(ErrorCode::IOWrt, error);
                 }
 
                 // no space available on disk

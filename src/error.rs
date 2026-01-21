@@ -17,7 +17,7 @@ impl GraveError {
 
     /// Get context of the error for [`GraveError`]
     #[inline]
-    pub const fn context(&self) -> &String {
+    pub fn context(&self) -> &str {
         &self.cntx
     }
 }
@@ -37,19 +37,11 @@ impl GraveError {
     }
 
     #[inline]
-    pub(crate) fn map_err<R>(code: ErrorCode, error: std::io::Error) -> GraveResult<R> {
-        Err(Self {
+    pub(crate) fn from_poison<T>(code: ErrorCode, error: std::sync::PoisonError<T>) -> Self {
+        Self {
             code,
             cntx: error.to_string(),
-        })
-    }
-
-    #[inline]
-    pub(crate) fn poison_err<T, R>(code: ErrorCode, error: std::sync::PoisonError<T>) -> GraveResult<R> {
-        Err(Self {
-            code,
-            cntx: error.to_string(),
-        })
+        }
     }
 }
 
@@ -80,6 +72,14 @@ pub(crate) enum ErrorCode {
     IOEof = 0x204,
     /// (517) syncing error
     IOSyn = 0x205,
+    /// (518) mutext poisoned
+    IOMpn = 0x206,
+    /// (519) thread poisoned
+    IOTpn = 0x207,
+    /// (520) no write perm
+    IOWrt = 0x208,
+    /// (521) no read perm
+    IORed = 0x209,
 
     /// (1024) internal fuck up
     MMHcf = 0x400,
@@ -89,21 +89,21 @@ pub(crate) enum ErrorCode {
     MMNsp = 0x402,
     /// (1027) syncing error
     MMSyn = 0x403,
+    /// (1028) mutext poisoned
+    MMMpn = 0x404,
+    /// (1029) thread poisoned
+    MMTpn = 0x405,
 
-    /// (768) unknown thread error
-    MTUnk = 0x300,
-    /// (769) mutext posioned
-    MTMpn = 0x301,
-    /// (770) thread paniced
-    MTTpn = 0x302,
+    /// (1280) lock error
+    BPLck = 0x500,
+    /// (1281) mutex poisoned
+    BPMpn = 0x501,
 
     /// (128) invalid path
     PHInv = 0x80,
 
-    /// (256) no write perm
-    PMWrt = 0x100,
-    /// (257) no read perm
-    PMRed = 0x101,
+    /// (10) Grave Unknown error
+    GRUnk = 0x0A,
 }
 
 impl ErrorCode {
@@ -113,26 +113,31 @@ impl ErrorCode {
             // WARN: Error code must never be 0, as its used as placeholder for sane state (non errored state)
             0 => unimplemented!(),
 
-            0x80 => ErrorCode::PHInv,
-            0x101 => ErrorCode::PMWrt,
+            0x200 => Self::IOHcf,
+            0x201 => Self::IOUnk,
+            0x202 => Self::IONsp,
+            0x203 => Self::IOLck,
+            0x204 => Self::IOEof,
+            0x205 => Self::IOSyn,
+            0x206 => Self::IOMpn,
+            0x207 => Self::IOTpn,
+            0x208 => Self::IOWrt,
+            0x209 => Self::IORed,
 
-            0x200 => ErrorCode::IOHcf,
-            0x201 => ErrorCode::IOUnk,
-            0x202 => ErrorCode::IONsp,
-            0x203 => ErrorCode::IOLck,
-            0x204 => ErrorCode::IOEof,
-            0x205 => ErrorCode::IOSyn,
+            0x400 => Self::MMHcf,
+            0x401 => Self::MMUnk,
+            0x402 => Self::MMNsp,
+            0x403 => Self::MMSyn,
+            0x404 => Self::MMMpn,
+            0x405 => Self::MMTpn,
 
-            0x400 => ErrorCode::MMHcf,
-            0x401 => ErrorCode::MMUnk,
-            0x402 => ErrorCode::MMNsp,
-            0x403 => ErrorCode::MMSyn,
+            0x500 => Self::BPLck,
+            0x501 => Self::BPMpn,
 
-            0x300 => ErrorCode::MTUnk,
-            0x301 => ErrorCode::MTMpn,
-            0x302 => ErrorCode::MTTpn,
+            0x80 => Self::PHInv,
+            0x0A => Self::GRUnk,
 
-            _ => Self::IOUnk, // defensive fallback
+            _ => Self::GRUnk, // defensive fallback
         }
     }
 }
