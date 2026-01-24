@@ -1,10 +1,7 @@
 use crate::{error::ErrorCode, GraveError, GraveResult};
-use std::{
-    ptr::NonNull,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Condvar, Mutex, MutexGuard,
-    },
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Condvar, Mutex,
 };
 
 const INVALID_POOL_SLOT: u64 = u32::MAX as u64;
@@ -101,7 +98,7 @@ impl BufPool {
             }
 
             // local walk
-            let mut cur = idx;
+            let cur = idx;
             let mut last = cur;
             let mut count = 1;
             while count < n {
@@ -170,7 +167,8 @@ impl BufPool {
             .lock
             .lock()
             .map_err(|e| GraveError::from_poison(ErrorCode::BPLck, e))?;
-        self.cdvr
+        let _cdvr = self
+            .cdvr
             .wait(guard)
             .map_err(|e| GraveError::from_poison(ErrorCode::BPMpn, e))?;
         Ok(())
@@ -488,7 +486,6 @@ mod tests {
     mod shutdown_safety {
         use super::*;
         use std::sync::Arc;
-        use std::thread;
 
         #[test]
         fn drop_waits_for_active_allocations() {

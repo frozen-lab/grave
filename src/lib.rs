@@ -8,12 +8,13 @@
 
 mod error;
 mod hints;
-
-#[allow(unused)]
 mod pool;
 
 #[allow(unused)]
 mod system;
+
+#[allow(unused)]
+mod warden;
 
 pub use error::{GraveError, GraveResult};
 
