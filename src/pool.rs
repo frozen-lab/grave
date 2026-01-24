@@ -71,6 +71,13 @@ impl BufPool {
     ///
     /// This function may not allocate all the `N` required buffers in one call,
     /// so the caller must poll (wait and retry) for remaining `N` buffers.
+    ///
+    /// ## RAII Safety
+    ///
+    /// All [`BufPool`] aloocations are RAII safe by default, hence when the variable
+    /// which stores the result of `allocate`, is dropped, the buffer's it holds are
+    /// also automatically freed. The burden of _freeing after use_ does not fall on
+    /// the caller.
     #[inline(always)]
     pub(crate) fn allocate(&self, n: usize) -> Allocation {
         // NOTE: safe to pre-incr as there are no abrupt/error exit here
@@ -131,7 +138,7 @@ impl BufPool {
     }
 
     #[inline(always)]
-    pub(crate) fn free(&self, ptr: &PoolPtr) {
+    fn free(&self, ptr: &PoolPtr) {
         let offset = self.ptr.offset_from(&ptr);
         let idx = offset as u64 / self.size;
 
@@ -219,8 +226,8 @@ const fn pack_pool_idx(idx: u64, tag: u64) -> u64 {
 }
 
 #[inline]
-const fn unpack_pool_idx(v: u64) -> (u64, u64) {
-    (v & POOL_IDX_MASK, v >> POOL_IDX_BITS)
+const fn unpack_pool_idx(id: u64) -> (u64, u64) {
+    (id & POOL_IDX_MASK, id >> POOL_IDX_BITS)
 }
 
 //
@@ -296,6 +303,211 @@ impl Drop for AllocationGuard<'_> {
             if let Ok(_g) = self.0.lock.lock() {
                 self.0.shutdown_cdvr.notify_one();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CAP: u32 = 0x20;
+    const SIZE: usize = 0x0A;
+
+    mod sanity_check {
+        use super::*;
+
+        #[test]
+        fn new_works() {
+            let pool = BufPool::new(CAP, SIZE);
+
+            assert_eq!(pool.cap, CAP as u64);
+            assert_eq!(pool.size, SIZE as u64);
+            assert!(!pool.ptr.ptr().is_null());
+            assert_eq!(pool.next.len(), CAP as usize);
+        }
+
+        #[test]
+        fn pack_unpack_cycle() {
+            let pack_id = pack_pool_idx(0x20, 0x0A);
+            let (idx, tag) = unpack_pool_idx(pack_id);
+
+            assert_eq!(idx, 0x20);
+            assert_eq!(tag, 0x0A);
+        }
+    }
+
+    mod allocate {
+        use super::*;
+
+        #[test]
+        fn alloc_exact_capacity() {
+            let pool = BufPool::new(8, SIZE);
+            let alloc = pool.allocate(8);
+
+            assert_eq!(alloc.count, 8);
+            assert_eq!(alloc.slots.len(), 8);
+        }
+
+        #[test]
+        fn alloc_partial_when_exhausted() {
+            let pool = BufPool::new(4, SIZE);
+
+            let a1 = pool.allocate(3);
+            assert_eq!(a1.count, 3);
+
+            let a2 = pool.allocate(3);
+            assert_eq!(a2.count, 1);
+
+            let a3 = pool.allocate(1);
+            assert_eq!(a3.count, 0);
+        }
+
+        #[test]
+        fn alloc_returns_zero_when_empty() {
+            let pool = BufPool::new(2, SIZE);
+
+            let _a1 = pool.allocate(2);
+            let a2 = pool.allocate(1);
+
+            assert_eq!(a2.count, 0);
+        }
+
+        #[test]
+        fn no_duplicate_slots_in_single_alloc() {
+            let pool = BufPool::new(8, SIZE);
+
+            let alloc = pool.allocate(8);
+            let mut ptrs: Vec<_> = alloc.slots.iter().map(|s| s.ptr()).collect();
+
+            ptrs.sort();
+            ptrs.dedup();
+
+            assert_eq!(ptrs.len(), 8);
+        }
+    }
+
+    mod raii_safety {
+        use super::*;
+
+        #[test]
+        fn raii_frees_on_drop() {
+            let pool = BufPool::new(4, SIZE);
+
+            {
+                let alloc = pool.allocate(4);
+                assert_eq!(alloc.count, 4);
+            }
+
+            let alloc2 = pool.allocate(4);
+            assert_eq!(alloc2.count, 4);
+        }
+
+        #[test]
+        fn raii_partial_free() {
+            let pool = BufPool::new(4, SIZE);
+
+            let a1 = pool.allocate(3);
+            drop(a1);
+
+            let a2 = pool.allocate(4);
+            assert_eq!(a2.count, 4);
+        }
+    }
+
+    mod concurrency {
+        use super::*;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        #[test]
+        fn concurrent_alloc_free_stress() {
+            const THREADS: usize = 8;
+            const ITERS: usize = 0x1000;
+
+            let pool = Arc::new(BufPool::new(THREADS as u32, SIZE));
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            let mut handles = Vec::new();
+
+            for _ in 0..THREADS {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+
+                    for _ in 0..ITERS {
+                        let alloc = pool.allocate(1);
+                        if alloc.count == 0 {
+                            pool.wait().unwrap();
+                            continue;
+                        }
+                        // freed on drop
+                    }
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+
+            let final_alloc = pool.allocate(THREADS);
+            assert_eq!(final_alloc.count, THREADS);
+        }
+
+        #[test]
+        fn concurrent_batch_alloc() {
+            const THREADS: usize = 4;
+
+            let pool = Arc::new(BufPool::new(8, SIZE));
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            let mut handles = Vec::new();
+
+            for _ in 0..THREADS {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    let alloc = pool.allocate(2);
+                    assert!(alloc.count <= 2);
+                }));
+            }
+
+            for h in handles {
+                assert!(h.join().is_ok());
+            }
+
+            let final_alloc = pool.allocate(8);
+            assert_eq!(final_alloc.count, 8);
+        }
+    }
+
+    mod shutdown_safety {
+        use super::*;
+        use std::sync::Arc;
+        use std::thread;
+
+        #[test]
+        fn drop_waits_for_active_allocations() {
+            let pool = Arc::new(BufPool::new(4, SIZE));
+            let pool2 = pool.clone();
+
+            let handle = std::thread::spawn(move || {
+                let alloc = pool2.allocate(4);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(alloc);
+            });
+
+            // give the other thread time to allocate
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            // this must block until alloc is dropped
+            drop(pool);
+
+            assert!(handle.join().is_ok());
         }
     }
 }
