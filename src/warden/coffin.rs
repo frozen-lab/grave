@@ -1,9 +1,9 @@
+use super::common::COFFIN_PATH;
 use crate::{
     system::{IOFlushMode, OsFile},
     GraveResult,
 };
 
-const PATH: &'static str = "coffin";
 const FLUSH_MODE: IOFlushMode = IOFlushMode::Background;
 
 #[derive(Debug)]
@@ -13,13 +13,13 @@ pub(super) struct Coffin {
 
 impl Coffin {
     pub(super) fn new(dirpath: &std::path::PathBuf, init_len: u64) -> GraveResult<Self> {
-        let filepath = dirpath.join(PATH);
+        let filepath = dirpath.join(COFFIN_PATH);
         let file = OsFile::new(filepath, FLUSH_MODE, init_len)?;
         Ok(Self { file })
     }
 
     pub(super) fn open(dirpath: &std::path::PathBuf) -> GraveResult<Self> {
-        let filepath = dirpath.join(PATH);
+        let filepath = dirpath.join(COFFIN_PATH);
         let file = OsFile::open(filepath, FLUSH_MODE)?;
         Ok(Self { file })
     }
